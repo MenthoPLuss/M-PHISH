@@ -4,7 +4,7 @@ Training happens offline in ``train_url_cnn.py`` (PyTorch). The trained weights 
 exported to a checksum-pinned JSON artifact, the same deployment rule as the linear
 model: no pickle/torch files are ever loaded by the application.
 
-Two artifact formats are supported (architecture must match the training script exactly):
+Three artifact formats are supported (architecture must match the training script exactly):
 
 ``m-phish-charcnn-v1``
     chars -> embedding(E) -> parallel Conv1d(kernel k, F filters) + ReLU
@@ -18,6 +18,11 @@ Two artifact formats are supported (architecture must match the training script 
           -> global max pool ++ global mean pool (2C) -> Linear(H) + ReLU -> Linear(1)
     Batch norm is folded into the convolutions at export. Ensemble members' logits are
     averaged. Weights are stored as base64 little-endian float32 inside the JSON.
+
+``m-phish-charcnn-v3`` (masked gated residual CNN)
+    Full hostname -> char + role embeddings -> stem -> dilated depthwise/gated blocks
+    with per-position layer normalization -> masked max, mean, attention and domain-name
+    pooling -> classifier. Padding is masked throughout, including between convolutions.
 
 The logit is Platt-calibrated on a held-out split, and a validation-selected
 threshold decides whether the model contributes a warning floor.
@@ -43,6 +48,9 @@ ARTIFACT_FORMAT = "m-phish-charcnn-v1"
 FEATURE_VERSION = "hostname-chars-v1"
 ARTIFACT_FORMAT_V2 = "m-phish-charcnn-v2"
 FEATURE_VERSION_V2 = "hostname-chars-roles-v1"
+ARTIFACT_FORMAT_V3 = "m-phish-charcnn-v3"
+FEATURE_VERSION_V3 = "hostname-chars-roles-masked-v1"
+NORM_EPS = 1e-5
 # Index 0 = padding, 1 = unknown character, then this alphabet.
 ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789-._"
 PAD, UNKNOWN = 0, 1
@@ -167,6 +175,7 @@ class UrlCnnModel:
             version = {
                 ARTIFACT_FORMAT: FEATURE_VERSION,
                 ARTIFACT_FORMAT_V2: FEATURE_VERSION_V2,
+                ARTIFACT_FORMAT_V3: FEATURE_VERSION_V3,
             }.get(data.get("format"))
             if version is None or data.get("alphabet") != ALPHABET:
                 raise ValueError("Incompatible CNN artifact format or alphabet")
@@ -178,18 +187,22 @@ class UrlCnnModel:
                 if not allow_ungated and (not allow or os.getenv("APP_ENV") == "production"):
                     raise ValueError("Artifact has not passed its scoped detection gates")
                 self.ungated = True
-            if data["format"] == ARTIFACT_FORMAT_V2:
+            if data["format"] == ARTIFACT_FORMAT_V3:
+                self.members = self._load_v3(data)
+            elif data["format"] == ARTIFACT_FORMAT_V2:
                 self.members = self._load_v2(data)
             else:
                 self.weights = self._load_weights(data)
             self._check_calibration(data)
             self.artifact, self.reason = data, None
-        except (OSError, ValueError, TypeError, KeyError) as exc:
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
             self.artifact = None
             self.reason = f"URL CNN unavailable: {type(exc).__name__}: {exc}"
 
     @property
     def feature_version(self) -> str:
+        if self.artifact and self.artifact.get("format") == ARTIFACT_FORMAT_V3:
+            return FEATURE_VERSION_V3
         if self.artifact and self.artifact.get("format") == ARTIFACT_FORMAT_V2:
             return FEATURE_VERSION_V2
         return FEATURE_VERSION
@@ -285,9 +298,66 @@ class UrlCnnModel:
             )
         return loaded
 
+    @staticmethod
+    def _load_v3(data: dict) -> list[dict]:
+        def dimension(key, low, high):
+            value = data[key]
+            if type(value) is not int or not low <= value <= high:
+                raise ValueError(f"Unsupported CNN dimension: {key}")
+            return value
+
+        dimension("max_length", 8, 253)
+        dim = dimension("embedding_dim", 1, 256)
+        channels = dimension("channels", 2, 512)
+        hidden = dimension("hidden", 1, 1024)
+        k = dimension("kernel_size", 3, 7)
+        dilations = data["dilations"]
+        if k % 2 == 0 or not isinstance(dilations, list) or not 1 <= len(dilations) <= 16:
+            raise ValueError("Unsupported CNN dimensions")
+        if any(type(d) is not int or not 1 <= d <= 64 for d in dilations):
+            raise ValueError("Unsupported CNN dilations")
+        members = data["members"]
+        if not isinstance(members, list) or not 1 <= len(members) <= MAX_MEMBERS:
+            raise ValueError("Unsupported ensemble size")
+
+        def pair(entry, weight_shape, bias_shape, name):
+            return (
+                _packed(entry["weight"], weight_shape, name + ".weight"),
+                _packed(entry["bias"], bias_shape, name + ".bias"),
+            )
+
+        loaded = []
+        for member in members:
+            if len(member["blocks"]) != len(dilations):
+                raise ValueError("Block count does not match dilations")
+            loaded.append(
+                {
+                    "embedding": _packed(member["embedding"], (VOCAB_SIZE, dim), "embedding"),
+                    "roles": _packed(member["role_embedding"], (ROLE_COUNT, dim), "roles"),
+                    "stem": pair(member["stem"], (channels, dim, k), (channels,), "stem"),
+                    "norm": pair(member["norm"], (channels,), (channels,), "norm"),
+                    "blocks": [
+                        {
+                            "depthwise": pair(b["depthwise"], (channels, 1, k), (channels,), "dw"),
+                            "norm": pair(b["norm"], (channels,), (channels,), "norm"),
+                            "gate": pair(
+                                b["gate"], (2 * channels, channels, 1), (2 * channels,), "gate"
+                            ),
+                            "scale": _packed(b["scale"], (channels,), "scale"),
+                            "dilation": d,
+                        }
+                        for b, d in zip(member["blocks"], dilations, strict=True)
+                    ],
+                    "attention": pair(member["attention"], (1, channels, 1), (1,), "attention"),
+                    "dense": pair(member["dense"], (hidden, 4 * channels), (hidden,), "dense"),
+                    "out": pair(member["out"], (1, hidden), (1,), "out"),
+                }
+            )
+        return loaded
+
     def logit(self, text: str) -> float:
         """Forward pass identical to the PyTorch module(s) used in training."""
-        if self.artifact.get("format") == ARTIFACT_FORMAT_V2:
+        if self.artifact.get("format") in (ARTIFACT_FORMAT_V2, ARTIFACT_FORMAT_V3):
             return float(np.mean([self.member_logit(m, text) for m in range(len(self.members))]))
         weights, length = self.weights, int(self.artifact["max_length"])
         x = weights["embedding"][encode(text, length)]  # (L, E)
@@ -301,7 +371,9 @@ class UrlCnnModel:
         return float((weights["out"] @ hidden + weights["out_bias"])[0])
 
     def member_logit(self, index: int, text: str) -> float:
-        """One v2 ensemble member (used directly by the training parity check)."""
+        """One deep ensemble member (used directly by the training parity check)."""
+        if self.artifact["format"] == ARTIFACT_FORMAT_V3:
+            return self._member_logit_v3(index, text)
         w, length = self.members[index], int(self.artifact["max_length"])
         h = w["embedding"][encode(text, length)] + w["roles"][encode_roles(text, length)]
         h = np.maximum(conv_same(h, *w["stem"], 1), 0)
@@ -311,6 +383,58 @@ class UrlCnnModel:
         pooled = np.concatenate([h.max(axis=0), h.mean(axis=0)])
         hidden = np.maximum(w["dense"] @ pooled + w["dense_bias"], 0)
         return float((w["out"] @ hidden + w["out_bias"])[0])
+
+    def _member_logit_v3(self, index: int, text: str) -> float:
+        w, length = self.members[index], int(self.artifact["max_length"])
+        length = max(1, min(length, len(text)))
+        chars, roles = encode(text, length), encode_roles(text, length)
+        mask = (chars != PAD)[:, None]
+
+        def norm(x, params):
+            weight, bias = params
+            return (x - x.mean(-1, keepdims=True)) / np.sqrt(
+                x.var(-1, keepdims=True) + NORM_EPS
+            ) * weight + bias
+
+        h = (w["embedding"][chars] + w["roles"][roles]) * mask
+        h = np.maximum(norm(conv_same(h, *w["stem"], 1), w["norm"]), 0) * mask
+        for block in w["blocks"]:
+            weight, bias = block["depthwise"]
+            k, dilation = weight.shape[-1], block["dilation"]
+            pad = dilation * (k - 1) // 2
+            padded = np.pad(h, ((pad, pad), (0, 0)))
+            branch = (
+                sum(
+                    padded[j * dilation : j * dilation + length] * weight[:, 0, j] for j in range(k)
+                )
+                + bias
+            )
+            branch = np.maximum(norm(branch, block["norm"]), 0) * mask
+            weight, bias = block["gate"]
+            value, gate = np.split(branch @ weight[:, :, 0].T + bias, 2, axis=1)
+            branch = value / (1 + np.exp(-np.clip(gate, -700, 700)))
+            h = (h + branch * block["scale"]) * mask
+        valid = h[mask[:, 0]]
+        if not len(valid):
+            pooled = np.zeros(4 * h.shape[1])
+        else:
+            weight, bias = w["attention"]
+            scores = valid @ weight[0, :, 0] + bias[0]
+            attention = np.exp(scores - scores.max())
+            attention /= attention.sum()
+            name = h[(roles == ROLE_NAME) & mask[:, 0]]
+            pooled = np.concatenate(
+                [
+                    valid.max(0),
+                    valid.mean(0),
+                    attention @ valid,
+                    name.mean(0) if len(name) else np.zeros(h.shape[1]),
+                ]
+            )
+        weight, bias = w["dense"]
+        hidden = np.maximum(weight @ pooled + bias, 0)
+        weight, bias = w["out"]
+        return float((weight @ hidden + bias)[0])
 
     def predict_hostname(self, hostname: str) -> Prediction:
         text = model_input(hostname)

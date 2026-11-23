@@ -16,4 +16,4 @@ Command and input provenance requirements are in `DATASETS.md`. A real-world ben
 
 ## Domain-name CNN
 
-A separate hostname-only character CNN (`m-phish-charcnn-v1`) can be trained offline with PyTorch and deployed as checksum-pinned JSON under the same release targets. It may only raise the model warning floor. See [URL_CNN.md](URL_CNN.md).
+A separate hostname-only character CNN (default `m-phish-charcnn-v3`, with v1/v2 artifact compatibility) can be trained offline with PyTorch and deployed as checksum-pinned JSON under the same release targets. It may only raise the model warning floor. See [the v3 training guide](URL_CNN_V3.md) and [the original baseline](URL_CNN.md).

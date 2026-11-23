@@ -5,7 +5,7 @@
       "id": "runName",
       "type": "promptString",
       "description": "Name for this training run (creates runs/<name>; must be new)",
-      "default": "cnn-1"
+      "default": "cnn-v3"
     }
   ],
   "tasks": [
@@ -25,6 +25,7 @@
       "windows": { "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe" },
       "args": [
         "-m", "backend.app.services.ml.train_url_cnn",
+        "--arch", "v3",
         "--download-phiusiil", "data/phiusiil",
         "--output", "runs/${input:runName}"
       ],
@@ -32,13 +33,13 @@
       "problemMatcher": []
     },
     {
-      "label": "ML: CNN smoke test (synthetic, 1 minute)",
+      "label": "ML: CNN v3 smoke test (synthetic)",
       "type": "process",
       "command": "${workspaceFolder}/.venv/bin/python",
       "windows": { "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe" },
       "args": [
         "-m", "backend.app.services.ml.train_url_cnn",
-        "--synthetic-smoke", "--epochs", "4",
+        "--arch", "v3", "--synthetic-smoke", "--epochs", "2", "--max-rows", "500",
         "--output", "runs/smoke-${input:runName}"
       ],
       "options": { "cwd": "${workspaceFolder}" },

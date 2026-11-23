@@ -1,5 +1,9 @@
 # Domain-name CNN
 
+**Current default: v3.** See [the v3 architecture, analysis and training guide](URL_CNN_V3.md).
+The architecture and timing below describe the original v1 baseline; the commands
+explicitly select v1 for reproducibility. v1 and v2 artifacts remain supported.
+
 A character-level convolutional neural network that scores a website's **hostname**
 (for example `secure-paypa1-verify.com`) for phishing-like patterns. It complements
 the rule engine and the multimodal linear model. It never marks a site safe.
@@ -57,12 +61,12 @@ strings, wherever they appear in the name.
    ```
 2. Optional one-minute smoke test on generated data. Its gate always fails, by design:
    ```powershell
-   .\.venv\Scripts\python.exe -m backend.app.services.ml.train_url_cnn --synthetic-smoke --epochs 4 --output runs\smoke
+   .\.venv\Scripts\python.exe -m backend.app.services.ml.train_url_cnn --arch v1 --synthetic-smoke --epochs 4 --output runs\smoke
    ```
 3. Train on PhiUSIIL. This downloads the dataset from UCI on first use. Training is light: this sandbox
    processed about 8,000 hostnames per second on CPU, so an epoch takes well under a minute or two:
    ```powershell
-   .\.venv\Scripts\python.exe -m backend.app.services.ml.train_url_cnn --download-phiusiil data\phiusiil --output runs\cnn-1
+   .\.venv\Scripts\python.exe -m backend.app.services.ml.train_url_cnn --arch v1 --download-phiusiil data\phiusiil --output runs\cnn-1
    ```
    For a quick first try, add `--max-rows 30000 --epochs 3`. Every run needs a new
    `--output` folder; earlier runs are never overwritten.

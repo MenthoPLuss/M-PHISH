@@ -10,13 +10,14 @@ Examples (run from the project root):
     # Fast smoke test on generated hostnames (can never pass the release gate)
     python -m backend.app.services.ml.train_url_cnn --synthetic-smoke --output runs/smoke
 
-    # v2: deep residual CNN with domain-structure roles, optionally an ensemble
-    python -m backend.app.services.ml.train_url_cnn --arch v2 --ensemble 3 \
-        --download-phiusiil data/phiusiil --output runs/cnn-v2
+    # v3 (default): masked gated CNN with attention, optionally an ensemble
+    python -m backend.app.services.ml.train_url_cnn --arch v3 --ensemble 3 \
+        --download-phiusiil data/phiusiil --output runs/cnn-v3
 
 Outputs in --output: url_cnn.json (deployable artifact), results.json (evaluation-v2,
 readable by the Research page), manifest.json, splits.json, release_targets.json,
-checksums.txt. Requires PyTorch: pip install -r backend/requirements-cnn.txt
+training_config.json, history.json, checksums.txt. Requires PyTorch:
+pip install -r backend/requirements-cnn.txt
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ import hashlib
 import io
 import json
 import math
+import os
 import platform
 import random
 import sys
@@ -40,6 +42,7 @@ from urllib.parse import urlsplit
 
 import numpy as np
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import average_precision_score
 
 from ..observations import registrable_domain
 from .offline import RELEASE_TARGETS, canonical_hash, metrics, release_gate
@@ -48,10 +51,14 @@ from .url_cnn import (
     ALPHABET,
     ARTIFACT_FORMAT,
     ARTIFACT_FORMAT_V2,
+    ARTIFACT_FORMAT_V3,
     FEATURE_VERSION,
     FEATURE_VERSION_V2,
+    FEATURE_VERSION_V3,
+    NORM_EPS,
     PAD,
     ROLE_COUNT,
+    ROLE_NAME,
     VOCAB_SIZE,
     UrlCnnModel,
     encode,
@@ -116,9 +123,13 @@ def hostname_of(url: str) -> str:
         return ""
 
 
-def load_csv(path: Path, url_column: str, label_column: str, legit_value: str):
+def load_csv(
+    path: Path, url_column: str, label_column: str, legit_value: str, phishing_value: str = "0"
+):
     """Returns (hostnames, labels with 1 = phishing) after dedupe and conflict removal."""
     csv.field_size_limit(10_000_000)
+    if legit_value == phishing_value:
+        raise ValueError("Legitimate and phishing labels must differ")
     labels_by_host: dict[str, set[int]] = {}
     with path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -131,10 +142,13 @@ def load_csv(path: Path, url_column: str, label_column: str, legit_value: str):
         rows = 0
         for row in reader:
             rows += 1
-            host = hostname_of(row[url_column])
+            raw_label = (row.get(label_column) or "").strip()
+            if raw_label not in {legit_value, phishing_value}:
+                raise ValueError(f"Unknown label {raw_label!r} at CSV row {rows + 1}")
+            host = hostname_of(row.get(url_column) or "")
             if not host or len(host) > 253:
                 continue
-            label = 0 if row[label_column].strip() == legit_value else 1
+            label = 0 if raw_label == legit_value else 1
             labels_by_host.setdefault(host, set()).add(label)
     conflicts = [host for host, labels in labels_by_host.items() if len(labels) > 1]
     hosts = sorted(host for host, labels in labels_by_host.items() if len(labels) == 1)
@@ -227,12 +241,22 @@ def build_model(torch, embedding_dim, filters, kernel_sizes, hidden, dropout):
     return CharCNN()
 
 
-def logits_for(torch, model, X, batch=4096):
+def batch_input(model, values, device):
+    """Trim shared left padding only for the padding-invariant v3 architecture."""
+    if getattr(model, "padding_invariant", False):
+        length = max(1, int((values[:, 0] != PAD).sum(1).max()))
+        values = values[:, :, -length:]
+    return values.to(device)
+
+
+def logits_for(torch, model, X, batch=256):
     model.eval()
     out = []
-    with torch.no_grad():
+    device = next(model.parameters()).device
+    with torch.inference_mode():
         for i in range(0, len(X), batch):
-            out.append(model(torch.from_numpy(X[i : i + batch])).numpy())
+            values = batch_input(model, torch.from_numpy(X[i : i + batch]), device)
+            out.append(model(values).cpu().numpy())
     return np.concatenate(out).astype(np.float64) if out else np.zeros(0)
 
 
@@ -271,7 +295,7 @@ def train(torch, model, X, y, Xv, yv, epochs, batch_size, lr, seed):
 
 def export_weights(model, kernel_sizes) -> dict:
     def values(tensor):
-        return np.vectorize(lambda v: float(f"{v:.8g}"))(tensor.detach().numpy()).tolist()
+        return np.vectorize(lambda v: float(f"{v:.8g}"))(tensor.detach().cpu().numpy()).tolist()
 
     return {
         "embedding": values(model.embedding.weight),
@@ -342,8 +366,122 @@ def bce(logits, labels) -> float:
     return float(np.mean(np.maximum(z, 0) - z * y + np.log1p(np.exp(-np.abs(z)))))
 
 
-def train_deep(torch, model, X, y, Xv, yv, *, epochs, batch_size, lr, weight_decay, patience, seed):
-    """AdamW + one-cycle LR + gradient clipping; keeps the lowest-validation-loss epoch."""
+def build_model_v3(torch, embedding_dim, channels, kernel_size, dilations, hidden, dropout):
+    """Padding-invariant gated residual CNN with global and domain-aware pooling."""
+    nn = torch.nn
+
+    class Block(nn.Module):
+        def __init__(self, dilation):
+            super().__init__()
+            self.depthwise = nn.Conv1d(
+                channels,
+                channels,
+                kernel_size,
+                groups=channels,
+                padding=dilation * (kernel_size - 1) // 2,
+                dilation=dilation,
+            )
+            self.norm = nn.LayerNorm(channels, eps=NORM_EPS)
+            self.gate = nn.Conv1d(channels, 2 * channels, 1)
+            self.scale = nn.Parameter(torch.full((channels,), 0.1))
+            self.dropout = nn.Dropout(dropout)
+
+        def forward(self, h, mask):
+            branch = self.depthwise(h).transpose(1, 2)
+            branch = torch.relu(self.norm(branch)).transpose(1, 2) * mask
+            branch = torch.nn.functional.glu(self.gate(branch), dim=1)
+            return (h + self.dropout(branch) * self.scale[None, :, None]) * mask
+
+    class MaskedCharCNN(nn.Module):
+        padding_invariant = True
+
+        def __init__(self):
+            super().__init__()
+            self.embedding = nn.Embedding(VOCAB_SIZE, embedding_dim, padding_idx=PAD)
+            self.role_embedding = nn.Embedding(ROLE_COUNT, embedding_dim, padding_idx=PAD)
+            self.stem = nn.Conv1d(
+                embedding_dim, channels, kernel_size, padding=(kernel_size - 1) // 2
+            )
+            self.norm = nn.LayerNorm(channels, eps=NORM_EPS)
+            self.blocks = nn.ModuleList(Block(d) for d in dilations)
+            self.attention = nn.Conv1d(channels, 1, 1)
+            self.dropout = nn.Dropout(dropout)
+            self.dense = nn.Linear(4 * channels, hidden)
+            self.out = nn.Linear(hidden, 1)
+
+        def forward(self, x):
+            mask = (x[:, 0] != PAD).unsqueeze(1)
+            h = (self.embedding(x[:, 0]) + self.role_embedding(x[:, 1])).transpose(1, 2)
+            h = self.stem(h * mask).transpose(1, 2)
+            h = torch.relu(self.norm(h)).transpose(1, 2) * mask
+            for block in self.blocks:
+                h = block(h, mask)
+            count = mask.sum(2).clamp_min(1)
+            maximum = h.masked_fill(~mask, torch.finfo(h.dtype).min).amax(2)
+            maximum = torch.where(mask.any(2), maximum, torch.zeros_like(maximum))
+            scores = self.attention(h).masked_fill(~mask, torch.finfo(h.dtype).min)
+            weights = torch.softmax(scores, dim=2) * mask
+            name = (x[:, 1] == ROLE_NAME).unsqueeze(1) & mask
+            pooled = torch.cat(
+                [
+                    maximum,
+                    h.sum(2) / count,
+                    (h * weights).sum(2),
+                    (h * name).sum(2) / name.sum(2).clamp_min(1),
+                ],
+                dim=1,
+            )
+            hidden = torch.relu(self.dense(self.dropout(pooled)))
+            return self.out(self.dropout(hidden)).squeeze(1)
+
+    return MaskedCharCNN()
+
+
+def export_v3(model) -> dict:
+    def pack(tensor):
+        array = np.ascontiguousarray(tensor.detach().cpu().numpy(), dtype="<f4")
+        return base64.b64encode(array.tobytes()).decode("ascii")
+
+    def pair(module):
+        return {"weight": pack(module.weight), "bias": pack(module.bias)}
+
+    return {
+        "embedding": pack(model.embedding.weight),
+        "role_embedding": pack(model.role_embedding.weight),
+        "stem": pair(model.stem),
+        "norm": pair(model.norm),
+        "blocks": [
+            {
+                "depthwise": pair(b.depthwise),
+                "norm": pair(b.norm),
+                "gate": pair(b.gate),
+                "scale": pack(b.scale),
+            }
+            for b in model.blocks
+        ],
+        "attention": pair(model.attention),
+        "dense": pair(model.dense),
+        "out": pair(model.out),
+    }
+
+
+def train_deep(
+    torch,
+    model,
+    X,
+    y,
+    Xv,
+    yv,
+    *,
+    epochs,
+    batch_size,
+    lr,
+    weight_decay,
+    patience,
+    seed,
+    class_weight="none",
+):
+    """AdamW + warmup/cosine LR + clipping; selection uses unweighted validation BCE."""
     generator = torch.Generator().manual_seed(seed)
     decay = [p for p in model.parameters() if p.ndim >= 2]
     no_decay = [p for p in model.parameters() if p.ndim < 2]
@@ -352,26 +490,53 @@ def train_deep(torch, model, X, y, Xv, yv, *, epochs, batch_size, lr, weight_dec
         lr=lr,
     )
     steps = math.ceil(len(X) / batch_size)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=lr, total_steps=epochs * steps, pct_start=0.1
-    )
-    loss_fn = torch.nn.BCEWithLogitsLoss()
+    total_steps = epochs * steps
+    warmup = max(1, int(0.1 * total_steps))
+
+    def schedule(step):
+        if step < warmup:
+            return (step + 1) / warmup
+        progress = min(1.0, (step - warmup) / max(1, total_steps - warmup - 1))
+        return 0.05 + 0.95 * (1 + math.cos(math.pi * progress)) / 2
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
+    device = next(model.parameters()).device
+    positive_weight = float((y == 0).sum() / (y == 1).sum()) if class_weight == "balanced" else 1.0
+    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(positive_weight, device=device))
     Xt, yt = torch.from_numpy(X), torch.from_numpy(y.astype(np.float32))
     best, stale = (float("inf"), None, 0), 0
+    model.training_history = []
+    model.positive_weight = positive_weight
     for epoch in range(1, epochs + 1):
         model.train()
         order = torch.randperm(len(Xt), generator=generator)
         total, started = 0.0, time.perf_counter()
         for i in range(0, len(order), batch_size):
             index = order[i : i + batch_size]
-            optimizer.zero_grad()
-            loss = loss_fn(model(Xt[index]), yt[index])
+            optimizer.zero_grad(set_to_none=True)
+            values = batch_input(model, Xt[index], device)
+            loss = loss_fn(model(values), yt[index].to(device))
+            if not torch.isfinite(loss):
+                raise ValueError("Nonfinite training loss; lower the learning rate or check data")
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
             optimizer.step()
             scheduler.step()
             total += loss.item() * len(index)
-        val_loss = bce(logits_for(torch, model, Xv), yv)
+        val_logits = logits_for(torch, model, Xv, batch=batch_size)
+        val_loss = bce(val_logits, yv)
+        if not math.isfinite(val_loss):
+            raise ValueError("Nonfinite validation loss")
+        model.training_history.append(
+            {
+                "epoch": epoch,
+                "train_loss": total / len(Xt),
+                "validation_loss": val_loss,
+                "validation_pr_auc": float(average_precision_score(yv, val_logits)),
+                "learning_rate": optimizer.param_groups[0]["lr"],
+                "seconds": time.perf_counter() - started,
+            }
+        )
         print(
             f"epoch {epoch}/{epochs}  train_loss={total / len(Xt):.4f}  "
             f"val_loss={val_loss:.4f}  ({time.perf_counter() - started:.1f}s)",
@@ -379,7 +544,11 @@ def train_deep(torch, model, X, y, Xv, yv, *, epochs, batch_size, lr, weight_dec
         )
         if val_loss < best[0] - 1e-4:
             best, stale = (
-                (val_loss, {k: v.clone() for k, v in model.state_dict().items()}, epoch),
+                (
+                    val_loss,
+                    {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+                    epoch,
+                ),
                 0,
             )
         else:
@@ -421,7 +590,7 @@ def export_v2(model) -> dict:
 
 
 def model_features(hosts: list[str], arch: str, max_length: int) -> np.ndarray:
-    """(N, L) character ids for v1; (N, 2, L) character + role ids for v2."""
+    """(N, L) character ids for v1; (N, 2, L) character + role ids for v2/v3."""
     chars = np.stack([encode(h, max_length) for h in hosts])
     if arch == "v1":
         return chars
@@ -457,14 +626,14 @@ def shortcut_audit(features: dict[str, np.ndarray], y: np.ndarray, limit=0.97) -
 
 
 def select_threshold(labels, probabilities) -> float:
-    """Same rule and result as offline.select_threshold, vectorized for large splits.
+    """Maximize validation recall under the release confidence bounds.
 
-    Among thresholds meeting precision >= 0.95, recall >= 0.90 and FPR <= 0.01 on the
-    validation split, pick the highest (recall, precision, threshold); else 0.5.
+    If infeasible, retain the FPR bound where possible. Validation failure is still
+    reported and prevents release; never silently fall back to an unsafe 0.5 cutoff.
     """
     labels = np.asarray(labels)
     probabilities = np.asarray(probabilities, dtype=float)
-    thresholds = np.unique(probabilities)
+    thresholds = np.unique(np.append(probabilities, 1.0))
     order = np.sort(probabilities)
     positives = np.sort(probabilities[labels == 1])
     negatives = np.sort(probabilities[labels == 0])
@@ -476,9 +645,24 @@ def select_threshold(labels, probabilities) -> float:
         precision = np.where(predicted > 0, tp / predicted, 0.0)
         recall = tp / max(1, len(positives)) if len(positives) else np.zeros_like(thresholds)
         fpr = fp / len(negatives) if len(negatives) else np.full_like(thresholds, np.nan)
-    ok = (precision >= 0.95) & (recall >= 0.90) & (fpr <= 0.01)
+
+    def bounds(successes, total):
+        total = np.maximum(total, 1)
+        p, z = successes / total, 1.959963984540054
+        center = (p + z * z / (2 * total)) / (1 + z * z / total)
+        half = z * np.sqrt(p * (1 - p) / total + z * z / (4 * total * total)) / (1 + z * z / total)
+        return center - half, center + half
+
+    precision_low, _ = bounds(tp, predicted)
+    recall_low, _ = bounds(tp, len(positives))
+    _, fpr_high = bounds(fp, len(negatives))
+    ok = (predicted > 0) & (precision_low >= 0.95) & (recall_low >= 0.90) & (fpr_high <= 0.01)
     if not np.any(ok):
-        return 0.5
+        ok = (fpr_high <= 0.01) if len(negatives) else np.zeros_like(thresholds, dtype=bool)
+    if not np.any(ok):
+        ok = fpr <= 0.01
+    if not np.any(ok):
+        return 1.0
     candidates = sorted(
         zip(recall[ok].tolist(), precision[ok].tolist(), thresholds[ok].tolist(), strict=True)
     )
@@ -519,6 +703,18 @@ def run(args) -> dict:
     output.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    random.seed(args.seed)
+    torch.set_num_threads(args.threads)
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested but is unavailable; use --device cpu")
+    device = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
+    if device == "auto":
+        device = "cpu"
+    torch.use_deterministic_algorithms(True)
+    if device == "cuda":
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.benchmark = False
+    print(f"Training {args.arch} on {device} with {args.threads} CPU threads", flush=True)
 
     if args.synthetic_smoke:
         hosts, y = synthetic_hostnames(args.max_rows or 3000, args.seed)
@@ -538,7 +734,9 @@ def run(args) -> dict:
             if args.download_phiusiil
             else Path(args.csv)
         )
-        hosts, y = load_csv(csv_path, args.url_column, args.label_column, args.legit_label)
+        hosts, y = load_csv(
+            csv_path, args.url_column, args.label_column, args.legit_label, args.phishing_label
+        )
         if args.max_rows and len(hosts) > args.max_rows:
             keep = np.random.RandomState(args.seed).choice(len(hosts), args.max_rows, replace=False)
             keep.sort()
@@ -553,8 +751,18 @@ def run(args) -> dict:
         }
         if args.csv and not args.download_phiusiil:
             manifest["source"] = "User-supplied CSV " + csv_path.name
+            manifest["dataset_version"] = "csv-" + manifest["sha256"][:12]
+            manifest["license"] = "Operator-supplied; not independently verified"
+            manifest["label_methodology"] = "Explicit CSV labels; reduced to hostname"
             manifest["usage_permission"] = "Supplied by the operator; verify licence and labels."
+    if len(hosts) < 80 or len(np.unique(y)) != 2:
+        raise ValueError("At least 80 unique hostnames and both classes are required")
+    manifest["label_mapping"] = {"legitimate": args.legit_label, "phishing": args.phishing_label}
+    manifest["truncated_hostnames"] = sum(len(h) > args.max_length for h in hosts)
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (output / "training_config.json").write_text(
+        json.dumps(vars(args) | {"resolved_device": device}, indent=2)
+    )
 
     # Subdomains of one registrable domain never straddle splits.
     groups = np.array([registrable_domain(h) or h for h in hosts])
@@ -572,10 +780,11 @@ def run(args) -> dict:
 
     train_idx, val_idx = splits["train"], splits["validation"]
     models, best_epochs = [], []
-    for member in range(args.ensemble if args.arch == "v2" else 1):
+    for member in range(args.ensemble):
         torch.manual_seed(args.seed + member)
-        if args.arch == "v2":
-            model = build_model_v2(
+        if args.arch in {"v2", "v3"}:
+            builder = build_model_v3 if args.arch == "v3" else build_model_v2
+            model = builder(
                 torch,
                 args.embedding_dim,
                 args.channels,
@@ -593,64 +802,78 @@ def run(args) -> dict:
                 args.hidden,
                 args.dropout,
             )
+        model.to(device)
         parameters = sum(p.numel() for p in model.parameters())
-        label = f"member {member + 1}/{args.ensemble}: " if args.arch == "v2" else ""
+        label = f"member {member + 1}/{args.ensemble}: "
         print(f"Training {label}{len(train_idx)} hostnames, {parameters} parameters")
-        if args.arch == "v2":
-            best_epochs.append(
-                train_deep(
-                    torch,
-                    model,
-                    X[train_idx],
-                    y[train_idx],
-                    X[val_idx],
-                    y[val_idx],
-                    epochs=args.epochs,
-                    batch_size=args.batch_size,
-                    lr=args.lr,
-                    weight_decay=args.weight_decay,
-                    patience=args.patience,
-                    seed=args.seed + member,
-                )
+        best_epochs.append(
+            train_deep(
+                torch,
+                model,
+                X[train_idx],
+                y[train_idx],
+                X[val_idx],
+                y[val_idx],
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                patience=args.patience,
+                seed=args.seed + member,
+                class_weight=args.class_weight,
             )
-        else:
-            best_epochs.append(
-                train(
-                    torch,
-                    model,
-                    X[train_idx],
-                    y[train_idx],
-                    X[val_idx],
-                    y[val_idx],
-                    args.epochs,
-                    args.batch_size,
-                    args.lr,
-                    args.seed,
-                )
+        )
+        # Keep completed members on CPU so ensembles do not accumulate GPU memory.
+        models.append(model.cpu())
+        (output / "history.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "member": i,
+                        "seed": args.seed + i,
+                        "best_epoch": best_epochs[i],
+                        "positive_weight": m.positive_weight,
+                        "epochs": m.training_history,
+                    }
+                    for i, m in enumerate(models)
+                ],
+                indent=2,
+                allow_nan=False,
             )
-        models.append(model)
+        )
 
     def ensemble_logits(features):
-        return np.mean([logits_for(torch, m, features) for m in models], axis=0)
+        values = []
+        for m in models:
+            m.to(device)
+            values.append(logits_for(torch, m, features, batch=args.batch_size))
+            m.cpu()
+        return np.mean(values, axis=0)
 
-    logits = {name: ensemble_logits(X[idx]) for name, idx in splits.items()}
+    logits = {
+        name: ensemble_logits(X[splits[name]]) for name in ("calibration", "validation", "test")
+    }
     calibrator = calibrate(logits["calibration"], y[splits["calibration"]])
 
     def probabilities(name):
         return calibrator.predict_proba(logits[name].reshape(-1, 1))[:, 1]
 
     threshold = select_threshold(y[splits["validation"]], probabilities("validation"))
+    validation_result = metrics(y[splits["validation"]], probabilities("validation"), threshold)
     test_probs = probabilities("test")
     result = metrics(y[splits["test"]], test_probs, threshold)
     gate = (
         "passed"
-        if release_gate(result) and not shortcuts and manifest["kind"] == "real_labelled"
+        if release_gate(result)
+        and release_gate(validation_result)
+        and not shortcuts
+        and manifest["kind"] == "real_labelled"
         else "failed"
     )
 
     artifact = {
         "alphabet": ALPHABET,
-        "release_gate": gate,
+        "release_gate": "failed",  # only promote after export parity succeeds
         "max_length": args.max_length,
         "embedding_dim": args.embedding_dim,
         "hidden": args.hidden,
@@ -660,17 +883,17 @@ def run(args) -> dict:
         "dataset_manifest": manifest,
         "release_targets": RELEASE_TARGETS,
     }
-    if args.arch == "v2":
+    if args.arch in {"v2", "v3"}:
         import tldextract
 
         artifact |= {
-            "format": ARTIFACT_FORMAT_V2,
-            "feature_version": FEATURE_VERSION_V2,
-            "model_version": manifest["dataset_version"] + "-charcnn-v2",
+            "format": ARTIFACT_FORMAT_V3 if args.arch == "v3" else ARTIFACT_FORMAT_V2,
+            "feature_version": FEATURE_VERSION_V3 if args.arch == "v3" else FEATURE_VERSION_V2,
+            "model_version": manifest["dataset_version"] + "-charcnn-" + args.arch,
             "channels": args.channels,
             "kernel_size": args.kernel_size,
             "dilations": args.dilations,
-            "members": [export_v2(m) for m in models],
+            "members": [(export_v3(m) if args.arch == "v3" else export_v2(m)) for m in models],
             "best_epochs": best_epochs,
             "tldextract_version": tldextract.__version__,
         }
@@ -700,6 +923,10 @@ def run(args) -> dict:
     parity = float(np.max(np.abs(numpy_logits - ensemble_logits(X[sample]))))
     if parity > 1e-3:
         raise RuntimeError(f"Numpy/PyTorch parity failed: max logit difference {parity}")
+    artifact["release_gate"] = gate
+    artifact_bytes = json.dumps(artifact, sort_keys=True, allow_nan=False).encode()
+    artifact_path.write_bytes(artifact_bytes)
+    sha = hashlib.sha256(artifact_bytes).hexdigest()
 
     # A trivial-feature baseline shows how much the CNN adds beyond length/dots/digits.
     feats = simple_features(hosts)
@@ -721,17 +948,21 @@ def run(args) -> dict:
 
     experiments = [
         experiment_record(
-            "CNN-HOST" if args.arch == "v1" else "CNN2-HOST",
+            {"v1": "CNN-HOST", "v2": "CNN2-HOST", "v3": "CNN3-HOST"}[args.arch],
             "char-CNN: hostname characters"
             if args.arch == "v1"
-            else f"deep residual char-CNN x{len(models)}: hostname characters + domain roles",
+            else f"{args.arch} residual char-CNN x{len(models)}: hostname characters + domain roles",
             result,
             splits,
             manifest["kind"],
             manifest["dataset_version"],
             {
                 "num_features": args.max_length,
-                "model_family": "char_cnn" if args.arch == "v1" else "deep_residual_char_cnn",
+                "model_family": {
+                    "v1": "char_cnn",
+                    "v2": "deep_residual_char_cnn",
+                    "v3": "masked_gated_char_cnn",
+                }[args.arch],
                 "parameters": int(sum(p.numel() for m in models for p in m.parameters())),
                 "ensemble_members": len(models),
                 "best_epochs": best_epochs,
@@ -739,6 +970,8 @@ def run(args) -> dict:
                 "latency_scope": "numpy single-hostname inference averaged over test sample",
                 "release_gate": gate,
                 "numpy_torch_max_logit_difference": parity,
+                "validation_metrics": validation_result,
+                "validation_gate": "passed" if release_gate(validation_result) else "failed",
             },
         ),
         experiment_record(
@@ -761,6 +994,7 @@ def run(args) -> dict:
         "model_sha256": sha,
         "hardware": {"platform": platform.platform(), "python": platform.python_version()},
         "dependencies": {"torch": torch.__version__, "numpy": np.__version__},
+        "training_config": vars(args) | {"resolved_device": device},
         "limitations": [
             "Hostname-only model: page content, paths and behaviour are not seen.",
             "Random grouped holdout by registrable domain; temporal generalization is untested.",
@@ -817,43 +1051,106 @@ def main(argv=None):
     parser.add_argument(
         "--legit-label", default="1", help="label value meaning legitimate (PhiUSIIL: 1)"
     )
+    parser.add_argument(
+        "--phishing-label", default="0", help="phishing label; all other values fail"
+    )
     parser.add_argument("--max-rows", type=int, default=0, help="subsample for quick experiments")
     parser.add_argument(
         "--arch",
-        choices=["v1", "v2"],
-        default="v1",
-        help="v1 = original shallow CNN (default); v2 = deep residual CNN with domain roles",
+        choices=["v1", "v2", "v3"],
+        default="v3",
+        help="v1: shallow; v2: batch-norm residual; v3 (default): masked gated CNN + attention",
     )
-    parser.add_argument("--epochs", type=int, help="maximum epochs (v1: 6, v2: 30)")
-    parser.add_argument("--batch-size", type=int, help="(v1: 256, v2: 256)")
-    parser.add_argument("--lr", type=float, help="v1: Adam lr 2e-3; v2: one-cycle peak 3e-3")
-    parser.add_argument("--max-length", type=int, default=64)
+    parser.add_argument("--epochs", type=int, help="maximum epochs (v1: 6; v2/v3: 30)")
+    parser.add_argument("--batch-size", type=int, help="v1/v2: 256; v3: 128")
+    parser.add_argument("--lr", type=float, help="peak learning rate (v1/v3: 2e-3; v2: 3e-3)")
+    parser.add_argument("--max-length", type=int, help="v1/v2: 64; v3: 253 (full hostname)")
     parser.add_argument("--embedding-dim", type=int, default=32)
     parser.add_argument("--hidden", type=int, help="(v1: 64, v2: 128)")
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--threads", type=int, default=min(8, os.cpu_count() or 1))
+    parser.add_argument(
+        "--class-weight",
+        choices=["none", "balanced"],
+        default="none",
+        help="optional training-only negative/positive class ratio",
+    )
     v1 = parser.add_argument_group("v1 only")
     v1.add_argument("--filters", type=int, default=64)
     v1.add_argument("--kernel-sizes", type=int, nargs="+", default=[2, 3, 4, 5])
-    v2 = parser.add_argument_group("v2 only")
-    v2.add_argument("--channels", type=int, default=128)
-    v2.add_argument("--kernel-size", type=int, choices=[3, 5, 7], default=3)
-    v2.add_argument(
-        "--dilations", type=int, nargs="+", default=[1, 2, 4, 8, 1, 2, 4, 8], help="one per block"
-    )
+    v2 = parser.add_argument_group("v2/v3 architecture and shared optimizer")
+    v2.add_argument("--channels", type=int, help="v2: 128; v3: 64")
+    v2.add_argument("--kernel-size", type=int, choices=[3, 5, 7])
+    v2.add_argument("--dilations", type=int, nargs="+", help="one per residual block")
     v2.add_argument("--ensemble", type=int, default=1, help="independently seeded members (1-8)")
     v2.add_argument("--weight-decay", type=float, default=1e-4)
     v2.add_argument("--patience", type=int, default=5, help="early-stop epochs; 0 disables")
     args = parser.parse_args(argv)
     defaults = {
-        "v1": {"epochs": 6, "batch_size": 256, "lr": 2e-3, "hidden": 64},
-        "v2": {"epochs": 30, "batch_size": 256, "lr": 3e-3, "hidden": 128},
+        "v1": {"epochs": 6, "batch_size": 256, "lr": 2e-3, "hidden": 64, "max_length": 64},
+        "v2": {
+            "epochs": 30,
+            "batch_size": 256,
+            "lr": 3e-3,
+            "hidden": 128,
+            "max_length": 64,
+            "channels": 128,
+            "kernel_size": 3,
+            "dilations": [1, 2, 4, 8, 1, 2, 4, 8],
+        },
+        "v3": {
+            "epochs": 30,
+            "batch_size": 128,
+            "lr": 2e-3,
+            "hidden": 128,
+            "max_length": 253,
+            "channels": 64,
+            "kernel_size": 5,
+            "dilations": [1, 2, 4, 8, 16],
+        },
     }[args.arch]
     for key, value in defaults.items():
         if getattr(args, key) is None:
             setattr(args, key, value)
     if not 1 <= args.ensemble <= 8:
         parser.error("--ensemble must be between 1 and 8")
+    if args.arch == "v1" and args.ensemble != 1:
+        parser.error("v1 supports only --ensemble 1")
+    if args.epochs < 1 or args.batch_size < 1 or args.threads < 1 or args.patience < 0:
+        parser.error(
+            "epochs, batch size and threads must be positive; patience must be nonnegative"
+        )
+    if not math.isfinite(args.lr) or args.lr <= 0:
+        parser.error("--lr must be positive and finite")
+    if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
+        parser.error("--weight-decay must be nonnegative and finite")
+    if not 0 <= args.dropout < 1:
+        parser.error("--dropout must be in [0, 1)")
+    if (
+        not 8 <= args.max_length <= 253
+        or not 1 <= args.embedding_dim <= 256
+        or not 1 <= args.hidden <= 1024
+    ):
+        parser.error("unsupported length, embedding or hidden dimensions")
+    if args.max_rows < 0 or (args.max_rows and args.max_rows < 80):
+        parser.error("--max-rows must be 0 (all) or at least 80")
+    if not 0 <= args.seed < 2**32 - 8:
+        parser.error("--seed must be between 0 and 2**32 - 9")
+    if args.legit_label == args.phishing_label:
+        parser.error("--legit-label and --phishing-label must differ")
+    if args.arch == "v1":
+        if not 1 <= args.filters <= 512 or not all(
+            1 <= k <= args.max_length for k in args.kernel_sizes
+        ):
+            parser.error("unsupported v1 filters or kernel sizes")
+    elif not (
+        2 <= args.channels <= 512
+        and 1 <= len(args.dilations) <= 16
+        and all(1 <= d <= 64 for d in args.dilations)
+    ):
+        parser.error("unsupported channels or dilations")
     return run(args)
 
 
