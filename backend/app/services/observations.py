@@ -1,5 +1,6 @@
 """Shared observation semantics. Missing data must never be a benign observation."""
 
+from functools import lru_cache
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 
@@ -26,17 +27,38 @@ def normalized_host(url: str) -> str:
         return ""
 
 
+@lru_cache(maxsize=1)
+def _suffix_extractor():
+    # Parsing the bundled public-suffix list costs ~40 ms, so build the extractor once.
+    import tldextract
+
+    return tldextract.TLDExtract(
+        suffix_list_urls=(), cache_dir=None, include_psl_private_domains=True
+    )
+
+
 def registrable_domain(host: str) -> str:
     """Bundled PSL, no network fetch. Conservative exact-host fallback if unavailable."""
     try:
-        import tldextract
-
-        result = tldextract.TLDExtract(
-            suffix_list_urls=(), cache_dir=None, include_psl_private_domains=True
-        )(host)
+        result = _suffix_extractor()(host)
         return result.top_domain_under_public_suffix or host
     except ImportError:
         return host
+
+
+def host_parts(host: str) -> tuple[str, str, str]:
+    """(subdomain, name, public suffix) from the bundled PSL, e.g. ("a", "example", "co.uk").
+
+    IP addresses and unknown suffixes give ("", host, ""). Without tldextract the whole
+    host is treated as the name.
+    """
+    try:
+        result = _suffix_extractor()(host)
+    except ImportError:
+        return "", host, ""
+    if not result.suffix or not result.domain:
+        return "", host, ""
+    return result.subdomain, result.domain, result.suffix
 
 
 def redacted_endpoint(url: str, base: str = "") -> str:

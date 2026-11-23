@@ -10,6 +10,10 @@ Examples (run from the project root):
     # Fast smoke test on generated hostnames (can never pass the release gate)
     python -m backend.app.services.ml.train_url_cnn --synthetic-smoke --output runs/smoke
 
+    # v2: deep residual CNN with domain-structure roles, optionally an ensemble
+    python -m backend.app.services.ml.train_url_cnn --arch v2 --ensemble 3 \
+        --download-phiusiil data/phiusiil --output runs/cnn-v2
+
 Outputs in --output: url_cnn.json (deployable artifact), results.json (evaluation-v2,
 readable by the Research page), manifest.json, splits.json, release_targets.json,
 checksums.txt. Requires PyTorch: pip install -r backend/requirements-cnn.txt
@@ -18,10 +22,12 @@ checksums.txt. Requires PyTorch: pip install -r backend/requirements-cnn.txt
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import hashlib
 import io
 import json
+import math
 import platform
 import random
 import sys
@@ -41,11 +47,15 @@ from .offline import split_indices as grouped_splits
 from .url_cnn import (
     ALPHABET,
     ARTIFACT_FORMAT,
+    ARTIFACT_FORMAT_V2,
     FEATURE_VERSION,
+    FEATURE_VERSION_V2,
     PAD,
+    ROLE_COUNT,
     VOCAB_SIZE,
     UrlCnnModel,
     encode,
+    encode_roles,
     model_input,
 )
 
@@ -274,6 +284,151 @@ def export_weights(model, kernel_sizes) -> dict:
     }
 
 
+# ---------------------------------------------------------------- v2: deep residual CNN
+
+
+def build_model_v2(torch, embedding_dim, channels, kernel_size, dilations, hidden, dropout):
+    """Char + role embeddings -> stem conv -> residual dilated blocks -> max++mean pool."""
+    nn = torch.nn
+
+    class ResidualBlock(nn.Module):
+        def __init__(self, dilation):
+            super().__init__()
+            pad = dilation * (kernel_size - 1) // 2
+            self.conv1 = nn.Conv1d(
+                channels, channels, kernel_size, padding=pad, dilation=dilation, bias=False
+            )
+            self.bn1 = nn.BatchNorm1d(channels)
+            self.conv2 = nn.Conv1d(
+                channels, channels, kernel_size, padding=pad, dilation=dilation, bias=False
+            )
+            self.bn2 = nn.BatchNorm1d(channels)
+            # Each residual branch starts at zero, so a deep stack starts as the identity.
+            nn.init.zeros_(self.bn2.weight)
+
+        def forward(self, h):
+            branch = torch.relu(self.bn1(self.conv1(h)))
+            return torch.relu(h + self.bn2(self.conv2(branch)))
+
+    class DeepCharCNN(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = nn.Embedding(VOCAB_SIZE, embedding_dim, padding_idx=PAD)
+            self.role_embedding = nn.Embedding(ROLE_COUNT, embedding_dim, padding_idx=PAD)
+            self.stem = nn.Conv1d(
+                embedding_dim, channels, kernel_size, padding=(kernel_size - 1) // 2, bias=False
+            )
+            self.stem_bn = nn.BatchNorm1d(channels)
+            self.blocks = nn.ModuleList(ResidualBlock(d) for d in dilations)
+            self.dropout = nn.Dropout(dropout)
+            self.dense = nn.Linear(2 * channels, hidden)
+            self.out = nn.Linear(hidden, 1)
+
+        def forward(self, x):  # x: (N, 2, L) = character ids, role ids
+            e = (self.embedding(x[:, 0]) + self.role_embedding(x[:, 1])).transpose(1, 2)
+            h = torch.relu(self.stem_bn(self.stem(e)))
+            for block in self.blocks:
+                h = block(h)
+            pooled = torch.cat([h.amax(dim=2), h.mean(dim=2)], dim=1)
+            z = torch.relu(self.dense(self.dropout(pooled)))
+            return self.out(self.dropout(z)).squeeze(1)
+
+    return DeepCharCNN()
+
+
+def bce(logits, labels) -> float:
+    """Numerically stable binary cross-entropy on numpy logits."""
+    z, y = np.asarray(logits, dtype=np.float64), np.asarray(labels, dtype=np.float64)
+    return float(np.mean(np.maximum(z, 0) - z * y + np.log1p(np.exp(-np.abs(z)))))
+
+
+def train_deep(torch, model, X, y, Xv, yv, *, epochs, batch_size, lr, weight_decay, patience, seed):
+    """AdamW + one-cycle LR + gradient clipping; keeps the lowest-validation-loss epoch."""
+    generator = torch.Generator().manual_seed(seed)
+    decay = [p for p in model.parameters() if p.ndim >= 2]
+    no_decay = [p for p in model.parameters() if p.ndim < 2]
+    optimizer = torch.optim.AdamW(
+        [{"params": decay, "weight_decay": weight_decay}, {"params": no_decay, "weight_decay": 0}],
+        lr=lr,
+    )
+    steps = math.ceil(len(X) / batch_size)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=lr, total_steps=epochs * steps, pct_start=0.1
+    )
+    loss_fn = torch.nn.BCEWithLogitsLoss()
+    Xt, yt = torch.from_numpy(X), torch.from_numpy(y.astype(np.float32))
+    best, stale = (float("inf"), None, 0), 0
+    for epoch in range(1, epochs + 1):
+        model.train()
+        order = torch.randperm(len(Xt), generator=generator)
+        total, started = 0.0, time.perf_counter()
+        for i in range(0, len(order), batch_size):
+            index = order[i : i + batch_size]
+            optimizer.zero_grad()
+            loss = loss_fn(model(Xt[index]), yt[index])
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            total += loss.item() * len(index)
+        val_loss = bce(logits_for(torch, model, Xv), yv)
+        print(
+            f"epoch {epoch}/{epochs}  train_loss={total / len(Xt):.4f}  "
+            f"val_loss={val_loss:.4f}  ({time.perf_counter() - started:.1f}s)",
+            flush=True,
+        )
+        if val_loss < best[0] - 1e-4:
+            best, stale = (
+                (val_loss, {k: v.clone() for k, v in model.state_dict().items()}, epoch),
+                0,
+            )
+        else:
+            stale += 1
+            if patience and stale >= patience:
+                print(f"Early stop: no validation improvement for {patience} epochs")
+                break
+    model.load_state_dict(best[1])
+    model.eval()
+    print(f"Using epoch {best[2]} (lowest validation loss {best[0]:.4f})")
+    return best[2]
+
+
+def export_v2(model) -> dict:
+    """Fold batch norm into the convolutions and pack every tensor as base64 float32."""
+
+    def pack(tensor):
+        array = np.ascontiguousarray(tensor.detach().cpu().numpy(), dtype="<f4")
+        return base64.b64encode(array.tobytes()).decode("ascii")
+
+    def fold(conv, bn):
+        scale = bn.weight / (bn.running_var + bn.eps).sqrt()
+        weight = conv.weight * scale[:, None, None]
+        bias = bn.bias - bn.running_mean * scale
+        if conv.bias is not None:
+            bias = bias + conv.bias * scale
+        return {"weight": pack(weight), "bias": pack(bias)}
+
+    return {
+        "embedding": pack(model.embedding.weight),
+        "role_embedding": pack(model.role_embedding.weight),
+        "stem": fold(model.stem, model.stem_bn),
+        "blocks": [
+            {"conv1": fold(b.conv1, b.bn1), "conv2": fold(b.conv2, b.bn2)} for b in model.blocks
+        ],
+        "dense": {"weight": pack(model.dense.weight), "bias": pack(model.dense.bias)},
+        "out": {"weight": pack(model.out.weight), "bias": pack(model.out.bias)},
+    }
+
+
+def model_features(hosts: list[str], arch: str, max_length: int) -> np.ndarray:
+    """(N, L) character ids for v1; (N, 2, L) character + role ids for v2."""
+    chars = np.stack([encode(h, max_length) for h in hosts])
+    if arch == "v1":
+        return chars
+    roles = np.stack([encode_roles(h, max_length) for h in hosts])
+    return np.stack([chars, roles], axis=1)
+
+
 # ---------------------------------------------------------------- audits
 
 
@@ -408,32 +563,77 @@ def run(args) -> dict:
     (output / "splits.json").write_text(
         json.dumps({k: [canonical_hash(hosts[i]) for i in v] for k, v in splits.items()})
     )
-    X = np.stack([encode(h, args.max_length) for h in hosts])
+    X = model_features(hosts, args.arch, args.max_length)
     shortcuts = shortcut_audit(
         simple_features([hosts[i] for i in splits["train"]]), y[splits["train"]]
     )
     if shortcuts:
         print(f"WARNING shortcut findings (training split): {shortcuts}")
 
-    model = build_model(
-        torch, args.embedding_dim, args.filters, args.kernel_sizes, args.hidden, args.dropout
-    )
-    print(
-        f"Training on {len(splits['train'])} hostnames, {sum(p.numel() for p in model.parameters())} parameters"
-    )
-    best_epoch = train(
-        torch,
-        model,
-        X[splits["train"]],
-        y[splits["train"]],
-        X[splits["validation"]],
-        y[splits["validation"]],
-        args.epochs,
-        args.batch_size,
-        args.lr,
-        args.seed,
-    )
-    logits = {name: logits_for(torch, model, X[idx]) for name, idx in splits.items()}
+    train_idx, val_idx = splits["train"], splits["validation"]
+    models, best_epochs = [], []
+    for member in range(args.ensemble if args.arch == "v2" else 1):
+        torch.manual_seed(args.seed + member)
+        if args.arch == "v2":
+            model = build_model_v2(
+                torch,
+                args.embedding_dim,
+                args.channels,
+                args.kernel_size,
+                args.dilations,
+                args.hidden,
+                args.dropout,
+            )
+        else:
+            model = build_model(
+                torch,
+                args.embedding_dim,
+                args.filters,
+                args.kernel_sizes,
+                args.hidden,
+                args.dropout,
+            )
+        parameters = sum(p.numel() for p in model.parameters())
+        label = f"member {member + 1}/{args.ensemble}: " if args.arch == "v2" else ""
+        print(f"Training {label}{len(train_idx)} hostnames, {parameters} parameters")
+        if args.arch == "v2":
+            best_epochs.append(
+                train_deep(
+                    torch,
+                    model,
+                    X[train_idx],
+                    y[train_idx],
+                    X[val_idx],
+                    y[val_idx],
+                    epochs=args.epochs,
+                    batch_size=args.batch_size,
+                    lr=args.lr,
+                    weight_decay=args.weight_decay,
+                    patience=args.patience,
+                    seed=args.seed + member,
+                )
+            )
+        else:
+            best_epochs.append(
+                train(
+                    torch,
+                    model,
+                    X[train_idx],
+                    y[train_idx],
+                    X[val_idx],
+                    y[val_idx],
+                    args.epochs,
+                    args.batch_size,
+                    args.lr,
+                    args.seed,
+                )
+            )
+        models.append(model)
+
+    def ensemble_logits(features):
+        return np.mean([logits_for(torch, m, features) for m in models], axis=0)
+
+    logits = {name: ensemble_logits(X[idx]) for name, idx in splits.items()}
     calibrator = calibrate(logits["calibration"], y[splits["calibration"]])
 
     def probabilities(name):
@@ -449,24 +649,41 @@ def run(args) -> dict:
     )
 
     artifact = {
-        "format": ARTIFACT_FORMAT,
-        "feature_version": FEATURE_VERSION,
         "alphabet": ALPHABET,
-        "model_version": manifest["dataset_version"] + "-charcnn-v1",
         "release_gate": gate,
         "max_length": args.max_length,
         "embedding_dim": args.embedding_dim,
-        "filters": args.filters,
-        "kernel_sizes": args.kernel_sizes,
         "hidden": args.hidden,
-        "weights": export_weights(model, args.kernel_sizes),
         "calibration_slope": float(calibrator.coef_[0, 0]),
         "calibration_intercept": float(calibrator.intercept_[0]),
         "threshold": float(threshold),
         "dataset_manifest": manifest,
         "release_targets": RELEASE_TARGETS,
-        "best_epoch": best_epoch,
     }
+    if args.arch == "v2":
+        import tldextract
+
+        artifact |= {
+            "format": ARTIFACT_FORMAT_V2,
+            "feature_version": FEATURE_VERSION_V2,
+            "model_version": manifest["dataset_version"] + "-charcnn-v2",
+            "channels": args.channels,
+            "kernel_size": args.kernel_size,
+            "dilations": args.dilations,
+            "members": [export_v2(m) for m in models],
+            "best_epochs": best_epochs,
+            "tldextract_version": tldextract.__version__,
+        }
+    else:
+        artifact |= {
+            "format": ARTIFACT_FORMAT,
+            "feature_version": FEATURE_VERSION,
+            "model_version": manifest["dataset_version"] + "-charcnn-v1",
+            "filters": args.filters,
+            "kernel_sizes": args.kernel_sizes,
+            "weights": export_weights(models[0], args.kernel_sizes),
+            "best_epoch": best_epochs[0],
+        }
     artifact_bytes = json.dumps(artifact, sort_keys=True, allow_nan=False).encode()
     artifact_path = output / "url_cnn.json"
     artifact_path.write_bytes(artifact_bytes)
@@ -480,7 +697,7 @@ def run(args) -> dict:
     started = time.perf_counter()
     numpy_logits = np.array([loaded.logit(hosts[i]) for i in sample])
     latency_ms = (time.perf_counter() - started) / max(1, len(sample)) * 1000
-    parity = float(np.max(np.abs(numpy_logits - logits_for(torch, model, X[sample]))))
+    parity = float(np.max(np.abs(numpy_logits - ensemble_logits(X[sample]))))
     if parity > 1e-3:
         raise RuntimeError(f"Numpy/PyTorch parity failed: max logit difference {parity}")
 
@@ -504,15 +721,20 @@ def run(args) -> dict:
 
     experiments = [
         experiment_record(
-            "CNN-HOST",
-            "char-CNN: hostname characters",
+            "CNN-HOST" if args.arch == "v1" else "CNN2-HOST",
+            "char-CNN: hostname characters"
+            if args.arch == "v1"
+            else f"deep residual char-CNN x{len(models)}: hostname characters + domain roles",
             result,
             splits,
             manifest["kind"],
             manifest["dataset_version"],
             {
                 "num_features": args.max_length,
-                "model_family": "char_cnn",
+                "model_family": "char_cnn" if args.arch == "v1" else "deep_residual_char_cnn",
+                "parameters": int(sum(p.numel() for m in models for p in m.parameters())),
+                "ensemble_members": len(models),
+                "best_epochs": best_epochs,
                 "inference_latency_ms": latency_ms,
                 "latency_scope": "numpy single-hostname inference averaged over test sample",
                 "release_gate": gate,
@@ -596,17 +818,43 @@ def main(argv=None):
         "--legit-label", default="1", help="label value meaning legitimate (PhiUSIIL: 1)"
     )
     parser.add_argument("--max-rows", type=int, default=0, help="subsample for quick experiments")
-    parser.add_argument("--epochs", type=int, default=6)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=2e-3)
+    parser.add_argument(
+        "--arch",
+        choices=["v1", "v2"],
+        default="v1",
+        help="v1 = original shallow CNN (default); v2 = deep residual CNN with domain roles",
+    )
+    parser.add_argument("--epochs", type=int, help="maximum epochs (v1: 6, v2: 30)")
+    parser.add_argument("--batch-size", type=int, help="(v1: 256, v2: 256)")
+    parser.add_argument("--lr", type=float, help="v1: Adam lr 2e-3; v2: one-cycle peak 3e-3")
     parser.add_argument("--max-length", type=int, default=64)
     parser.add_argument("--embedding-dim", type=int, default=32)
-    parser.add_argument("--filters", type=int, default=64)
-    parser.add_argument("--kernel-sizes", type=int, nargs="+", default=[2, 3, 4, 5])
-    parser.add_argument("--hidden", type=int, default=64)
+    parser.add_argument("--hidden", type=int, help="(v1: 64, v2: 128)")
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--seed", type=int, default=42)
-    return run(parser.parse_args(argv))
+    v1 = parser.add_argument_group("v1 only")
+    v1.add_argument("--filters", type=int, default=64)
+    v1.add_argument("--kernel-sizes", type=int, nargs="+", default=[2, 3, 4, 5])
+    v2 = parser.add_argument_group("v2 only")
+    v2.add_argument("--channels", type=int, default=128)
+    v2.add_argument("--kernel-size", type=int, choices=[3, 5, 7], default=3)
+    v2.add_argument(
+        "--dilations", type=int, nargs="+", default=[1, 2, 4, 8, 1, 2, 4, 8], help="one per block"
+    )
+    v2.add_argument("--ensemble", type=int, default=1, help="independently seeded members (1-8)")
+    v2.add_argument("--weight-decay", type=float, default=1e-4)
+    v2.add_argument("--patience", type=int, default=5, help="early-stop epochs; 0 disables")
+    args = parser.parse_args(argv)
+    defaults = {
+        "v1": {"epochs": 6, "batch_size": 256, "lr": 2e-3, "hidden": 64},
+        "v2": {"epochs": 30, "batch_size": 256, "lr": 3e-3, "hidden": 128},
+    }[args.arch]
+    for key, value in defaults.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+    if not 1 <= args.ensemble <= 8:
+        parser.error("--ensemble must be between 1 and 8")
+    return run(args)
 
 
 if __name__ == "__main__":
