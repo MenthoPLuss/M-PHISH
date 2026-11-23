@@ -12,6 +12,7 @@ def database(tmp_path, monkeypatch):
     monkeypatch.setenv("ALLOW_REGISTRATION", "true")
     monkeypatch.delenv("CRAWLER_URL", raising=False)
     monkeypatch.delenv("ML_ARTIFACT_PATH", raising=False)
+    monkeypatch.delenv("ML_CNN_ARTIFACT_PATH", raising=False)
     monkeypatch.setenv("EXTENSION_IDS", "a" * 32)
     if storage._engine is not None:
         storage._engine.dispose()

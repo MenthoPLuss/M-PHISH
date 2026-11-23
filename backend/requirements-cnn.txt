@@ -1,0 +1,3 @@
+# Offline CNN training only (never needed by the API, worker or dashboard).
+# On Windows/macOS this installs the CPU build; use pytorch.org instructions for a GPU build.
+torch>=2.4

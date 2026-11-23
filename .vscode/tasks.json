@@ -1,6 +1,49 @@
 {
   "version": "2.0.0",
+  "inputs": [
+    {
+      "id": "runName",
+      "type": "promptString",
+      "description": "Name for this training run (creates runs/<name>; must be new)",
+      "default": "cnn-1"
+    }
+  ],
   "tasks": [
+    {
+      "label": "ML: install PyTorch for CNN training",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "windows": { "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe" },
+      "args": ["-m", "pip", "install", "-r", "backend/requirements-cnn.txt"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "ML: train URL CNN (PhiUSIIL)",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "windows": { "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe" },
+      "args": [
+        "-m", "backend.app.services.ml.train_url_cnn",
+        "--download-phiusiil", "data/phiusiil",
+        "--output", "runs/${input:runName}"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "ML: CNN smoke test (synthetic, 1 minute)",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "windows": { "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe" },
+      "args": [
+        "-m", "backend.app.services.ml.train_url_cnn",
+        "--synthetic-smoke", "--epochs", "4",
+        "--output", "runs/smoke-${input:runName}"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
     {
       "label": "Backend: migrate database",
       "type": "process",

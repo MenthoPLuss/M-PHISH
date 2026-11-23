@@ -13,3 +13,7 @@ Initial gates are fixed before final-test access: 95% precision, 90% recall and 
 No real precision, recall, accuracy, false-positive rate or latency claim is made. Synthetic generators are labelled controlled fixtures; single-feature threshold audits catch the original dot-count separability. Remaining evaluation work includes licensed independently labelled records, temporal and subgroup evaluation, legitimate SSO/payment false warnings, end-to-end policy evaluation, cold/steady-state inference and uncertainty-supported operating points. The JSON metadata's `release_gate` is not a substitute for operator review of provenance and reproduced results.
 
 Command and input provenance requirements are in `DATASETS.md`. A real-world benchmark cannot be completed with the sample HTML fixtures in this repository.
+
+## Domain-name CNN
+
+A separate hostname-only character CNN (`m-phish-charcnn-v1`) can be trained offline with PyTorch and deployed as checksum-pinned JSON under the same release targets. It may only raise the model warning floor. See [URL_CNN.md](URL_CNN.md).

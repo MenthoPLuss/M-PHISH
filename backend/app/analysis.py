@@ -15,6 +15,7 @@ from .services.domain.analyzer import analyze as domain_unavailable
 from .services.download.analyzer import analyze_download
 from .services.identity.analyzer import analyze_identity
 from .services.ml.model import get_threat_model
+from .services.ml.url_cnn import get_url_cnn
 from .services.observations import page_available, registrable_domain
 from .services.privacy.analyzer import analyze_privacy
 from .services.risk.engine import assess
@@ -45,6 +46,25 @@ def ev(category, title, description, source, confidence, severity, weight):
         "redacted_value": None,
         "contribution": {"scale": "rule_weight", "value": weight},
     }
+
+
+def select_warning_model(primary, secondary):
+    """Pick the prediction that drives the single model warning floor.
+
+    The multimodal model keeps priority when it exceeds its own threshold; otherwise
+    the hostname CNN may raise the floor. With no CNN configured, behaviour is unchanged.
+    """
+
+    def warns(p):
+        return (
+            p.calibrated_probability is not None
+            and p.threshold is not None
+            and p.calibrated_probability >= p.threshold
+        )
+
+    if warns(primary) or not warns(secondary):
+        return primary
+    return secondary
 
 
 def analyze_url(url):
@@ -258,6 +278,23 @@ def build_report(
     prediction = get_threat_model().predict_multimodal(
         features, domain_analysis=domain, page_analysis=page, context=identity_context
     )
+    cnn_prediction = get_url_cnn().predict_hostname(urlsplit(url).hostname or "")
+    # Either model may raise the same single warning floor; neither adds to rule scores.
+    warning_model = select_warning_model(prediction, cnn_prediction)
+    if warning_model is cnn_prediction and cnn_prediction.is_phishing:
+        evidence.append(
+            ev(
+                "CONTEXT",
+                "Domain-name model flagged this hostname",
+                "A character-level model trained on labelled phishing and legitimate "
+                "hostnames scored this name above its warning threshold. It sees only the "
+                "hostname, so this is a pattern similarity, not proof of phishing.",
+                "url_cnn",
+                round(cnn_prediction.calibrated_probability or 0, 3),
+                "MEDIUM",
+                0,
+            )
+        )
     authenticity = compute_authenticity(
         identity.identity_consistency, domain, page, asdict(synthetic)
     )
@@ -267,9 +304,9 @@ def build_report(
         page,
         authenticity,
         privacy.privacy_risk_score,
-        prediction.calibrated_probability,
+        warning_model.calibrated_probability,
         evidence,
-        model_threshold=prediction.threshold,
+        model_threshold=warning_model.threshold,
     )
     download = analyze_download(url, page, raw_html, overall_trust=profile.overall_trust)
     if download.has_download and download.is_executable_or_script:
@@ -296,7 +333,10 @@ def build_report(
         + int(page.get("availability") == "available")
     ) / 4
     assessment = assess(
-        evidence, prediction.calibrated_probability, coverage, model_threshold=prediction.threshold
+        evidence,
+        warning_model.calibrated_probability,
+        coverage,
+        model_threshold=warning_model.threshold,
     )
     profile.coverage = coverage
     if assessment.level in ("HIGH", "CRITICAL") and profile.trust_state not in (
@@ -403,6 +443,7 @@ def build_report(
             )
         ),
         "ml_prediction": asdict(prediction),
+        "url_cnn_prediction": asdict(cnn_prediction),
         "safe_route": identity.safe_route,
         "limitations": limitations,
         "visual_analysis": visual,

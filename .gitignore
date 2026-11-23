@@ -9,3 +9,7 @@ node_modules/
 .ruff_cache/
 pytest-cache-files-*/
 *.tsbuildinfo
+
+# Datasets and training runs stay out of source control (docs/DATASETS.md)
+runs/
+data/phiusiil/
