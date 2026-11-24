@@ -6,6 +6,18 @@
       "type": "promptString",
       "description": "Name for this training run (creates runs/<name>; must be new)",
       "default": "cnn-v3"
+    },
+    {
+      "id": "feedName",
+      "type": "promptString",
+      "description": "Fresh dataset folder name (creates data/feeds/<name>; use the date, must be new)",
+      "default": "2026-11-24"
+    },
+    {
+      "id": "previousRun",
+      "type": "promptString",
+      "description": "Earlier run whose splits.json to keep (runs/<name>)",
+      "default": "cnn-v3-ens3"
     }
   ],
   "tasks": [
@@ -27,6 +39,34 @@
         "-m", "backend.app.services.ml.train_url_cnn",
         "--arch", "v3", "--ensemble", "3",
         "--download-phiusiil", "data/phiusiil",
+        "--output", "runs/${input:runName}"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "ML: build fresh hostname dataset",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "windows": { "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe" },
+      "args": [
+        "-m", "backend.app.services.ml.hostname_feeds",
+        "--phiusiil", "data/phiusiil/PhiUSIIL_Phishing_URL_Dataset.csv",
+        "--output", "data/feeds/${input:feedName}"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "ML: train URL CNN (fresh data)",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "windows": { "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe" },
+      "args": [
+        "-m", "backend.app.services.ml.train_url_cnn",
+        "--arch", "v3", "--ensemble", "3",
+        "--csv", "data/feeds/${input:feedName}/combined.csv",
+        "--reuse-splits", "runs/${input:previousRun}/splits.json",
         "--output", "runs/${input:runName}"
       ],
       "options": { "cwd": "${workspaceFolder}" },

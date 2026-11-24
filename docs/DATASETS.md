@@ -14,3 +14,13 @@ The separate manifest requires `dataset_version`, `source`, `license`, `usage_pe
 The command preserves an existing output directory and writes targets/splits before test evaluation. Outputs include `release_targets.json`, `splits.json`, `model.json`, `results.json` and checksums. Keep datasets and reports outside source control. Review shortcut findings, failure examples, supports and confidence intervals before considering deployment. Configure research reads with `ML_RESEARCH_RESULTS`; do not expose private input records through the research artifact.
 
 Unfinished evaluation: temporal holdout, manually reviewed near-template grouping, source-specific and language/device subgroups, warning-policy performance including deterministic rules, coverage/abstention population estimates, and independent replication. These are launch blockers for real-world detection claims, not zero-error results.
+
+## Hostname CNN datasets
+
+The domain-name CNN is trained separately, on hostnames only. Its sources are
+PhiUSIIL (CC BY 4.0), Phishing.Database (MIT) and Chrome UX Report top origins
+(CC BY 4.0, "Chrome UX Report by Google"). `backend.app.services.ml.hostname_feeds`
+downloads them into `data/feeds/<date>/`, which stays out of source control, and
+records each source's URL, checksum, licence and filtering counts. See
+[URL_CNN_V3.md](URL_CNN_V3.md#fresh-data) for the rules, the commands and when to
+retrain.

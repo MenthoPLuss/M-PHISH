@@ -13,3 +13,4 @@ pytest-cache-files-*/
 # Datasets and training runs stay out of source control (docs/DATASETS.md)
 runs/
 data/phiusiil/
+data/feeds/

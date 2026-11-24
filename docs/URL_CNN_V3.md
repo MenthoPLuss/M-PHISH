@@ -162,6 +162,104 @@ targets but still **fails the release gate**, whose recall bound requires 90%. T
 hostname alone does not carry enough signal for that. Inference time was measured
 for one hostname at a time on this workstation; the training run reported 5.0 ms.
 
+## Fresh data
+
+### Why PhiUSIIL alone is not enough
+
+The PhiUSIIL test split overstates real-world precision. 97% of its legitimate
+hostnames are bare registered domains, so the model learned that a subdomain
+suggests phishing. On hostnames that appear nowhere in PhiUSIIL, the 3-member
+ensemble above measured (2026-11-24):
+
+| Hostnames never seen in training | Flagged at the deployed threshold |
+| --- | ---: |
+| Phishing.Database phishing, bare domains | 69.6% |
+| Phishing.Database phishing, with subdomains | 98.1% |
+| Chrome UX Report websites, bare domains | 14.7% (false alarms) |
+| **Chrome UX Report websites, with subdomains** | **73.3% (false alarms)** |
+| Tranco top-10k domains | 12.1% (false alarms; many are DNS/CDN infrastructure) |
+
+### Building a fresher dataset
+
+`hostname_feeds` merges PhiUSIIL with two current public lists:
+
+| Source | Labels | Licence and credit |
+| --- | --- | --- |
+| [Phishing.Database](https://github.com/Phishing-Database/Phishing.Database) active phishing hostnames | phishing | MIT; keep its copyright notice with any copy of the data |
+| [Chrome UX Report](https://developer.chrome.com/docs/crux) top 1M origins, monthly snapshot from [zakird/crux-top-lists](https://github.com/zakird/crux-top-lists) | legitimate | CC BY 4.0, "Chrome UX Report by Google" |
+
+OpenPhish's community feed is not used: its terms exclude detection use and
+derivative works. PhishTank needs a registered application key and its data
+licence could not be confirmed. Tranco ranks DNS popularity, so it includes
+infrastructure and spam domains; it is used only as an extra evaluation set.
+
+```powershell
+# 1. Download the lists and build data\feeds\<name>\combined.csv (about 20 seconds).
+.\.venv\Scripts\python.exe -m backend.app.services.ml.hostname_feeds --phiusiil data\phiusiil\PhiUSIIL_Phishing_URL_Dataset.csv --output data\feeds\2026-11-24
+
+# 2. Train, keeping every earlier hostname in the split it had in an earlier run.
+.\.venv\Scripts\python.exe -m backend.app.services.ml.train_url_cnn --ensemble 3 --csv data\feeds\2026-11-24\combined.csv --reuse-splits runs\cnn-v3-ens3\splits.json --output runs\cnn-v3-fresh
+```
+
+VS Code: **"ML: build fresh hostname dataset"**, then **"ML: train URL CNN (fresh data)"**.
+
+The builder parses the lists as text only and never visits any listed site. It
+applies these rules and records each count in `combined.sources.json`, which the
+trainer copies into `manifest.json`:
+
+- PhiUSIIL rows are copied unchanged. New sources only add hostnames PhiUSIIL does
+  not already contain, so the PhiUSIIL test split stays identical across runs.
+- Only valid DNS names are accepted from the new sources (no IP addresses, spaces or
+  underscores).
+- A hostname listed by both new sources is dropped as ambiguous.
+- A phishing entry that is a bare domain whose domain also serves a CrUX website is
+  dropped. It is usually a compromised legitimate site.
+- A seeded random sample of each new source is kept: 100,000 each by default
+  (`--phishing-sample`, `--legit-sample`). This bounds training time; with the
+  defaults, training takes about twice as long as PhiUSIIL alone.
+
+`--reuse-splits` keeps a fair comparison when data is added. Every hostname from
+the earlier run keeps its split. New hostnames whose registered domain already sits
+in a split join that split. Only domains the earlier run never saw are newly split.
+
+### Result (2026-11-24)
+
+`runs\cnn-v3-fresh` trained with the commands above: 419,036 hostnames, 3 members,
+about 4.5 hours on 14 CPU threads. All numbers are on hostnames that no member
+trained on or used to pick its threshold. The Tranco sets are 5,000 random domains per
+rank range whose registered domain appears nowhere in the training data.
+
+| Test set | PhiUSIIL only (`cnn-v3-ens3`) | PhiUSIIL + fresh (`cnn-v3-fresh`) |
+| --- | ---: | ---: |
+| Fresh test hostnames (29,059): ROC-AUC | 0.819 | **0.924** |
+| Fresh test hostnames: phishing caught at 1% false alarms | 14.1% | **64.2%** |
+| CrUX websites, bare domains: false alarms | 14.7% | **1.2%** |
+| CrUX websites, with subdomains: false alarms | 73.3% | **3.1%** |
+| Tranco top 10k / 10k–100k / 100k–1M: false alarms | 12.1% / 10.5% / 12.2% | **5.1% / 2.5% / 2.6%** |
+| Phishing.Database phishing, bare domains: caught | **69.6%** | 65.7% |
+| Phishing.Database phishing, with subdomains: caught | **98.1%** | 76.4% |
+| PhiUSIIL test split (33,430): ROC-AUC | **0.923** | 0.899 |
+| PhiUSIIL test split: phishing caught at 1% false alarms | **70.8%** | 63.9% |
+
+The fresh model gives up some PhiUSIIL score, but that score depended on the
+shortcut. On PhiUSIIL's test split, the share of subdomain phishing it catches falls
+from 98.2% to 70.7%. The earlier model's higher figure came with flagging 73% of real
+subdomain websites. The fresh model is also more conservative on PhiUSIIL. Its
+threshold (0.893) keeps false alarms at or below 1% on a validation split that is half
+new data. On PhiUSIIL alone, the same threshold gives 0.17% false alarms, against
+0.99% for the earlier model.
+
+On the combined test split, the release gate still fails on recall: precision 98.1%,
+false-positive rate 0.92% (95% upper bound 1.02%), recall 62.8% against the 90% target.
+Like the earlier runs, it can only be served with `ML_CNN_ALLOW_UNGATED=true`.
+
+### When to retrain
+
+CrUX publishes a new snapshot each month, around the second Tuesday, and phishing
+lists change daily. Rebuilding into a new `data\feeds\<date>` folder and
+retraining every one to three months keeps the model current. Reuse the previous
+run's `splits.json` each time, so the test results remain comparable.
+
 ## Evaluation and artifacts
 
 Normalization, hostname deduplication and conflicting-label removal happen before

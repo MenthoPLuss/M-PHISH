@@ -745,6 +745,41 @@ def experiment_record(experiment_id, name, result, splits, kind, version, extra)
 # ---------------------------------------------------------------- main
 
 
+SPLIT_NAMES = ("train", "calibration", "validation", "test")
+
+
+def reuse_splits(hosts, y, groups, previous: dict, seed: int):
+    """Keep an earlier run's split for every hostname it contained.
+
+    A registrable-domain group that already has a hostname in some split stays wholly in
+    that split, so new subdomains of a known domain cannot leak across splits. Only groups
+    the earlier run never saw are split, with the usual grouped procedure. Returns the
+    splits and how many hostnames kept their earlier assignment.
+    """
+    if set(previous) != set(SPLIT_NAMES):
+        raise ValueError(f"--reuse-splits needs the splits {SPLIT_NAMES}, found {sorted(previous)}")
+    earlier = {digest: name for name, digests in previous.items() for digest in digests}
+    group_split: dict[str, str] = {}
+    kept = 0
+    for host, group in zip(hosts, groups, strict=True):
+        name = earlier.get(canonical_hash(host))
+        if name is None:
+            continue
+        kept += 1
+        if group_split.setdefault(group, name) != name:
+            raise ValueError(f"Domain group {group!r} spans several earlier splits")
+    assigned = np.array([group_split.get(g, "") for g in groups])
+    splits = {name: np.flatnonzero(assigned == name) for name in SPLIT_NAMES}
+    new = np.flatnonzero(assigned == "")
+    if len(new):
+        for name, local in grouped_splits(y[new], groups[new], seed).items():
+            splits[name] = np.sort(np.concatenate([splits[name], new[local]]))
+    for name, subset in splits.items():
+        if len(np.unique(y[subset])) != 2:
+            raise ValueError(f"{name} lacks class support after reusing splits")
+    return splits, kept
+
+
 def run(args) -> dict:
     try:
         import torch
@@ -808,6 +843,13 @@ def run(args) -> dict:
             manifest["license"] = "Operator-supplied; not independently verified"
             manifest["label_methodology"] = "Explicit CSV labels; reduced to hostname"
             manifest["usage_permission"] = "Supplied by the operator; verify licence and labels."
+            # Datasets built by hostname_feeds carry their provenance in a sidecar file.
+            sources = csv_path.with_suffix(".sources.json")
+            if sources.is_file():
+                manifest["sources"] = json.loads(sources.read_text())
+                manifest["license"] = "; ".join(
+                    s["license"] for s in manifest["sources"]["sources"].values()
+                )
     if len(hosts) < 80 or len(np.unique(y)) != 2:
         raise ValueError("At least 80 unique hostnames and both classes are required")
     manifest["label_mapping"] = {"legitimate": args.legit_label, "phishing": args.phishing_label}
@@ -819,7 +861,18 @@ def run(args) -> dict:
 
     # Subdomains of one registrable domain never straddle splits.
     groups = np.array([registrable_domain(h) or h for h in hosts])
-    splits = grouped_splits(y, groups, args.seed)
+    if args.reuse_splits:
+        previous = Path(args.reuse_splits)
+        splits, kept = reuse_splits(hosts, y, groups, json.loads(previous.read_text()), args.seed)
+        manifest["reused_splits"] = {
+            "file": str(previous),
+            "sha256": hashlib.sha256(previous.read_bytes()).hexdigest(),
+            "kept_hostnames": kept,
+        }
+        print(f"Reused {kept} previous split assignments; split {len(hosts) - kept} new hostnames")
+        (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    else:
+        splits = grouped_splits(y, groups, args.seed)
     (output / "release_targets.json").write_text(json.dumps(RELEASE_TARGETS, indent=2))
     (output / "splits.json").write_text(
         json.dumps({k: [canonical_hash(hosts[i]) for i in v] for k, v in splits.items()})
@@ -1134,6 +1187,12 @@ def main(argv=None):
         default="none",
         help="optional training-only negative/positive class ratio",
     )
+    parser.add_argument(
+        "--reuse-splits",
+        metavar="SPLITS_JSON",
+        help="keep each hostname's split from an earlier run's splits.json (fair comparison "
+        "after adding data); only domains that run never saw are newly split",
+    )
     v1 = parser.add_argument_group("v1 only")
     v1.add_argument("--filters", type=int, default=64)
     v1.add_argument("--kernel-sizes", type=int, nargs="+", default=[2, 3, 4, 5])
@@ -1215,6 +1274,8 @@ def main(argv=None):
         parser.error("--seed must be between 0 and 2**32 - 9")
     if args.legit_label == args.phishing_label:
         parser.error("--legit-label and --phishing-label must differ")
+    if args.reuse_splits and not Path(args.reuse_splits).is_file():
+        parser.error("--reuse-splits must name an existing splits.json")
     if args.arch == "v1":
         if not 1 <= args.filters <= 512 or not all(
             1 <= k <= args.max_length for k in args.kernel_sizes

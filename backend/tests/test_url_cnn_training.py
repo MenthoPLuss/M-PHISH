@@ -180,6 +180,7 @@ def test_threshold_respects_confidence_bounds_and_fpr_fallback():
         ["--char-dropout", "1"],
         ["--label-smoothing", "-0.1"],
         ["--ema-decay", "1.5"],
+        ["--reuse-splits", "missing-splits.json"],
     ],
 )
 def test_bad_configuration_fails_before_output_creation(tmp_path, options):
