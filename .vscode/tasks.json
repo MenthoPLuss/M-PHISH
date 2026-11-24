@@ -25,7 +25,7 @@
       "windows": { "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe" },
       "args": [
         "-m", "backend.app.services.ml.train_url_cnn",
-        "--arch", "v3",
+        "--arch", "v3", "--ensemble", "3",
         "--download-phiusiil", "data/phiusiil",
         "--output", "runs/${input:runName}"
       ],

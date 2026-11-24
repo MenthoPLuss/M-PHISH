@@ -177,6 +177,9 @@ def test_threshold_respects_confidence_bounds_and_fpr_fallback():
         ["--lr", "inf"],
         ["--arch", "v1", "--ensemble", "2"],
         ["--phishing-label", "1"],
+        ["--char-dropout", "1"],
+        ["--label-smoothing", "-0.1"],
+        ["--ema-decay", "1.5"],
     ],
 )
 def test_bad_configuration_fails_before_output_creation(tmp_path, options):
@@ -184,6 +187,57 @@ def test_bad_configuration_fails_before_output_creation(tmp_path, options):
     with pytest.raises(SystemExit):
         training.main(["--synthetic-smoke", "--output", str(output), *options])
     assert not output.exists()
+
+
+def test_character_dropout_keeps_padding_and_roles():
+    torch = pytest.importorskip("torch")
+    hosts = ["login.example.co.uk", "a.b", "paypal-secure-verify.xyz"] * 200
+    values = torch.from_numpy(training.model_features(hosts, "v3", 40))
+    augmented = training.augment_characters(torch, values, 0.3, torch.Generator().manual_seed(0))
+    chars, new_chars = values[:, 0], augmented[:, 0]
+    assert torch.equal(augmented[:, 1], values[:, 1])  # roles untouched
+    assert torch.equal(new_chars == url_cnn.PAD, chars == url_cnn.PAD)  # padding untouched
+    changed = new_chars != chars
+    assert torch.all(new_chars[changed] == url_cnn.UNKNOWN)
+    rate = changed.sum().item() / (chars != url_cnn.PAD).sum().item()
+    assert 0.25 < rate < 0.35
+    assert torch.equal(values[:, 0], chars)  # the input batch itself is not modified
+
+
+def test_regularised_training_is_reproducible_and_exports_the_average():
+    torch = pytest.importorskip("torch")
+    hosts, y = training.synthetic_hostnames(160, 1)
+    X = training.model_features(hosts, "v3", 32)
+
+    def fit(**recipe):
+        torch.manual_seed(5)
+        model = training.build_model_v3(torch, 4, 6, 3, [1, 2], 8, 0.1)
+        training.train_deep(
+            torch,
+            model,
+            X[:120],
+            y[:120],
+            X[120:],
+            y[120:],
+            epochs=3,
+            batch_size=16,
+            lr=3e-3,
+            weight_decay=1e-4,
+            patience=0,
+            seed=5,
+            **recipe,
+        )
+        return model
+
+    recipe = {"char_dropout": 0.1, "label_smoothing": 0.05, "ema_decay": 0.9}
+    first, second, plain = fit(**recipe), fit(**recipe), fit(char_dropout=0.1, label_smoothing=0.05)
+    assert first.training_recipe == recipe
+    pairs = list(zip(first.parameters(), second.parameters(), strict=True))
+    assert all(torch.equal(a, b) for a, b in pairs)  # same seed and recipe -> identical weights
+    averaged = list(zip(first.parameters(), plain.parameters(), strict=True))
+    assert any(not torch.equal(a, c) for a, c in averaged)  # EMA weights are what is kept
+    with pytest.raises(ValueError, match="must be in"):
+        fit(ema_decay=1.0)
 
 
 def test_one_step_training_export_history_and_synthetic_gate(tmp_path):
@@ -226,6 +280,11 @@ def test_one_step_training_export_history_and_synthetic_gate(tmp_path):
     assert history["best_epoch"] == 1
     assert history["epochs"][0]["validation_loss"] > 0
     assert history["positive_weight"] > 0
+    # v3 trains with the validated regularisation recipe unless told otherwise.
+    recipe = training.REGULARISER_DEFAULTS_V3
+    config = json.loads((output / "training_config.json").read_text())
+    assert {name: config[name] for name in recipe} == recipe
+    assert history["training_recipe"] == recipe
     for line in (output / "checksums.txt").read_text().splitlines():
         checksum, name = line.split("  ")
         assert hashlib.sha256((output / name).read_bytes()).hexdigest() == checksum

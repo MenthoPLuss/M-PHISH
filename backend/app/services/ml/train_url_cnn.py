@@ -59,6 +59,7 @@ from .url_cnn import (
     PAD,
     ROLE_COUNT,
     ROLE_NAME,
+    UNKNOWN,
     VOCAB_SIZE,
     UrlCnnModel,
     encode,
@@ -67,6 +68,8 @@ from .url_cnn import (
 )
 
 PHIUSIIL_URL = "https://archive.ics.uci.edu/static/public/967/phiusiil+phishing+url+dataset.zip"
+# Selected on the validation split only (docs/URL_CNN_V3.md, "Training recipe").
+REGULARISER_DEFAULTS_V3 = {"char_dropout": 0.1, "label_smoothing": 0.05, "ema_decay": 0.999}
 PHIUSIIL_MANIFEST = {
     "source": "PhiUSIIL Phishing URL Dataset, UCI Machine Learning Repository (id 967), "
     "Prasad & Chandra (2024), doi:10.24432/C5Z90W",
@@ -465,6 +468,19 @@ def export_v3(model) -> dict:
     }
 
 
+def augment_characters(torch, values, rate, generator):
+    """Copy of a batch with ``rate`` of the real characters replaced by UNKNOWN.
+
+    Padding and the role channel are never changed, so masks and domain structure stay
+    intact; the model has to rely on patterns rather than exact spellings.
+    """
+    values = values.clone()
+    chars = values[:, 0] if values.ndim == 3 else values
+    noise = torch.rand(chars.shape, generator=generator) < rate
+    chars[noise & (chars != PAD)] = UNKNOWN
+    return values
+
+
 def train_deep(
     torch,
     model,
@@ -480,8 +496,18 @@ def train_deep(
     patience,
     seed,
     class_weight="none",
+    char_dropout=0.0,
+    label_smoothing=0.0,
+    ema_decay=0.0,
 ):
-    """AdamW + warmup/cosine LR + clipping; selection uses unweighted validation BCE."""
+    """AdamW + warmup/cosine LR + clipping; selection uses unweighted validation BCE.
+
+    Regularisers (training only; the exported architecture is unchanged):
+    ``char_dropout`` replaces that fraction of real characters with UNKNOWN in each batch,
+    ``label_smoothing`` trains towards y*(1-e)+e/2 (Platt calibration restores probabilities),
+    ``ema_decay`` keeps an exponential moving average of the weights; the average is what
+    is validated, selected and exported.
+    """
     generator = torch.Generator().manual_seed(seed)
     decay = [p for p in model.parameters() if p.ndim >= 2]
     no_decay = [p for p in model.parameters() if p.ndim < 2]
@@ -504,9 +530,17 @@ def train_deep(
     positive_weight = float((y == 0).sum() / (y == 1).sum()) if class_weight == "balanced" else 1.0
     loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(positive_weight, device=device))
     Xt, yt = torch.from_numpy(X), torch.from_numpy(y.astype(np.float32))
-    best, stale = (float("inf"), None, 0), 0
+    if not (0 <= char_dropout < 1 and 0 <= label_smoothing < 1 and 0 <= ema_decay < 1):
+        raise ValueError("char_dropout, label_smoothing and ema_decay must be in [0, 1)")
+    ema = {k: v.detach().clone() for k, v in model.state_dict().items()} if ema_decay else None
+    best, stale, step = (float("inf"), None, 0), 0, 0
     model.training_history = []
     model.positive_weight = positive_weight
+    model.training_recipe = {
+        "char_dropout": char_dropout,
+        "label_smoothing": label_smoothing,
+        "ema_decay": ema_decay,
+    }
     for epoch in range(1, epochs + 1):
         model.train()
         order = torch.randperm(len(Xt), generator=generator)
@@ -514,15 +548,32 @@ def train_deep(
         for i in range(0, len(order), batch_size):
             index = order[i : i + batch_size]
             optimizer.zero_grad(set_to_none=True)
-            values = batch_input(model, Xt[index], device)
-            loss = loss_fn(model(values), yt[index].to(device))
+            values = Xt[index]
+            if char_dropout:
+                values = augment_characters(torch, values, char_dropout, generator)
+            target = yt[index]
+            if label_smoothing:
+                target = target * (1 - label_smoothing) + 0.5 * label_smoothing
+            loss = loss_fn(model(batch_input(model, values, device)), target.to(device))
             if not torch.isfinite(loss):
                 raise ValueError("Nonfinite training loss; lower the learning rate or check data")
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
             optimizer.step()
             scheduler.step()
+            step += 1
+            if ema is not None:
+                decay = min(ema_decay, (1 + step) / (10 + step))
+                with torch.no_grad():
+                    for key, value in model.state_dict().items():
+                        if value.dtype.is_floating_point:
+                            ema[key].mul_(decay).add_(value.detach(), alpha=1 - decay)
+                        else:
+                            ema[key].copy_(value)
             total += loss.item() * len(index)
+        if ema is not None:
+            live = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            model.load_state_dict(ema)
         val_logits = logits_for(torch, model, Xv, batch=batch_size)
         val_loss = bce(val_logits, yv)
         if not math.isfinite(val_loss):
@@ -556,6 +607,8 @@ def train_deep(
             if patience and stale >= patience:
                 print(f"Early stop: no validation improvement for {patience} epochs")
                 break
+        if ema is not None:
+            model.load_state_dict(live)  # keep optimising the live weights
     model.load_state_dict(best[1])
     model.eval()
     print(f"Using epoch {best[2]} (lowest validation loss {best[0]:.4f})")
@@ -821,6 +874,9 @@ def run(args) -> dict:
                 patience=args.patience,
                 seed=args.seed + member,
                 class_weight=args.class_weight,
+                char_dropout=args.char_dropout,
+                label_smoothing=args.label_smoothing,
+                ema_decay=args.ema_decay,
             )
         )
         # Keep completed members on CPU so ensembles do not accumulate GPU memory.
@@ -833,6 +889,7 @@ def run(args) -> dict:
                         "seed": args.seed + i,
                         "best_epoch": best_epochs[i],
                         "positive_weight": m.positive_weight,
+                        "training_recipe": m.training_recipe,
                         "epochs": m.training_history,
                     }
                     for i, m in enumerate(models)
@@ -1087,6 +1144,16 @@ def main(argv=None):
     v2.add_argument("--ensemble", type=int, default=1, help="independently seeded members (1-8)")
     v2.add_argument("--weight-decay", type=float, default=1e-4)
     v2.add_argument("--patience", type=int, default=5, help="early-stop epochs; 0 disables")
+    regularise = parser.add_argument_group(
+        "v2/v3 training regularisers (export unchanged; v3 defaults 0.1/0.05/0.999, v2 off)"
+    )
+    regularise.add_argument(
+        "--char-dropout", type=float, help="fraction of characters masked as UNKNOWN per batch"
+    )
+    regularise.add_argument("--label-smoothing", type=float, help="train towards y*(1-e)+e/2")
+    regularise.add_argument(
+        "--ema-decay", type=float, help="exponential moving average of weights; 0 disables"
+    )
     args = parser.parse_args(argv)
     defaults = {
         "v1": {"epochs": 6, "batch_size": 256, "lr": 2e-3, "hidden": 64, "max_length": 64},
@@ -1128,6 +1195,14 @@ def main(argv=None):
         parser.error("--weight-decay must be nonnegative and finite")
     if not 0 <= args.dropout < 1:
         parser.error("--dropout must be in [0, 1)")
+    # v3 defaults to the recipe that won validation model selection (docs/URL_CNN_V3.md);
+    # v2 keeps plain training because the recipe was not evaluated there.
+    recipe = REGULARISER_DEFAULTS_V3 if args.arch == "v3" else {}
+    for name in ("char_dropout", "label_smoothing", "ema_decay"):
+        if getattr(args, name) is None:
+            setattr(args, name, recipe.get(name, 0.0))
+        if not 0 <= getattr(args, name) < 1:
+            parser.error(f"--{name.replace('_', '-')} must be in [0, 1)")
     if (
         not 8 <= args.max_length <= 253
         or not 1 <= args.embedding_dim <= 256

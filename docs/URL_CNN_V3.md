@@ -65,11 +65,12 @@ already installed:
 # Small functional check; synthetic data can never pass the release gate.
 .\.venv\Scripts\python.exe -m backend.app.services.ml.train_url_cnn --synthetic-smoke --max-rows 500 --epochs 2 --output runs\v3-smoke
 
-# Full real-data run; downloads only when the dataset is absent.
-.\.venv\Scripts\python.exe -m backend.app.services.ml.train_url_cnn --download-phiusiil data\phiusiil --output runs\v3-full
-
-# Optional ensemble; requires roughly three times the training and inference work.
+# Recommended: three-member ensemble (the VS Code task "ML: train URL CNN" runs this).
+# About three times the training and inference work of a single model.
 .\.venv\Scripts\python.exe -m backend.app.services.ml.train_url_cnn --download-phiusiil data\phiusiil --ensemble 3 --device auto --output runs\v3-ensemble
+
+# Single model; downloads only when the dataset is absent.
+.\.venv\Scripts\python.exe -m backend.app.services.ml.train_url_cnn --download-phiusiil data\phiusiil --output runs\v3-full
 
 # Custom CSV with conventional 0=legitimate / 1=phishing labels.
 .\.venv\Scripts\python.exe -m backend.app.services.ml.train_url_cnn --csv data\custom.csv --legit-label 0 --phishing-label 1 --output runs\v3-custom
@@ -93,6 +94,73 @@ The implementation follows PyTorch's [LayerNorm](https://docs.pytorch.org/docs/s
 [AdamW](https://docs.pytorch.org/docs/stable/generated/torch.optim.AdamW.html) and
 [BCEWithLogitsLoss](https://docs.pytorch.org/docs/stable/generated/torch.nn.BCEWithLogitsLoss.html)
 semantics. The NumPy implementation is separately checked against exported PyTorch weights.
+
+## Training recipe
+
+v3 trains with three regularisers by default. They change only training; the
+exported artifact format and NumPy inference are unchanged.
+
+| Option | v3 default | Effect |
+| --- | --- | --- |
+| `--char-dropout` | 0.1 | Each batch replaces 10% of real characters with UNKNOWN. Padding and domain roles are untouched. The model cannot rely on any single character. |
+| `--label-smoothing` | 0.05 | Trains towards 0.025/0.975 instead of 0/1. PhiUSIIL contains label noise (for example `google.com` is labelled phishing). Platt calibration restores probabilities. |
+| `--ema-decay` | 0.999 | Keeps an exponential moving average of the weights (warm-up `min(decay, (1+t)/(10+t))`). The average is what is validated, checkpointed and exported. |
+
+Pass `0` to switch any of them off. v2 keeps them off by default because they were
+not evaluated there. Each value and its effect is recorded in `training_config.json`
+and in every member's `training_recipe` in `history.json`.
+
+### How it was chosen
+
+Model selection used only the validation split (32,548 hostnames, domain-disjoint
+from training). Models were Platt-calibrated on the calibration split. The test
+split was not scored during selection.
+
+| Model | Parameters | ROC-AUC | PR-AUC | Recall at 1% FPR | Recall at 0.5% FPR |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| v1, 20 epochs | 46,753 | 0.9136 | 0.9076 | 66.8% | 63.0% |
+| v2, 64 channels x 4 blocks, roles | 123,681 | 0.9129 | 0.9073 | 67.4% | 65.1% |
+| v3, previous defaults | 89,442 | 0.9112 | 0.9062 | 67.1% | 64.8% |
+| v3 + recipe, seeds 42/43/44 (range) | 89,442 | 0.9140-0.9148 | 0.9086-0.9087 | 67.5-68.3% | 64.9-65.7% |
+| v3 + recipe, 128 channels | 259,106 | 0.9161 | 0.9104 | 68.0% | 64.8% |
+| **v3 + recipe, 3-member ensemble** | 3 x 89,442 | **0.9187** | **0.9132** | **69.1%** | **66.5%** |
+
+What this showed:
+
+- Every hostname-only model lands within about 0.01 ROC-AUC of the others, so
+  size alone does not help. 70% of validation phishing hostnames are bare
+  registered domains, but so are 97% of legitimate ones. Recall on bare phishing
+  domains is about 61%, compared with about 99% for phishing that uses subdomains.
+- The recipe stopped v3 overfitting: validation loss kept improving until epoch
+  20-21, instead of epoch 11. Every seed beat the previous defaults.
+- Averaging independently seeded members gave the largest gain. Two members
+  reached 0.9174 and three reached 0.9187. A 128-channel member costs about 2.6
+  times the training time for a smaller single-model gain, so the ensemble uses
+  standard-width members.
+- On 14 CPU threads, one member took about 45 minutes to train.
+
+### Test result
+
+The chosen setup was trained once with the project script
+(`--arch v3 --ensemble 3`, recipe defaults, seed 42) and scored once on the test
+split. All three runs below use the identical domain-disjoint split: 33,430
+hostnames, 13,274 of them phishing, with matching `splits.json` checksums.
+
+| Model | ROC-AUC | PR-AUC | Recall at 0.5% FPR | Recall at 1% FPR | NumPy inference |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| v1 | 0.9142 | 0.9137 | 62.8% | 66.9% | 0.8 ms |
+| v3, previous defaults, 1 model, 10 epochs | 0.9150 | 0.9153 | 66.1% | 69.0% | 1.4 ms |
+| **v3 + recipe, 3-member ensemble** | **0.9225** | **0.9218** | **67.9%** | **70.8%** | 4.8 ms |
+
+Recall at a fixed FPR was computed afterwards from each exported artifact's logits.
+It was used for comparison only; nothing was tuned on test. At 1% FPR the ensemble
+catches 98% of phishing that uses subdomains and 56% of bare-domain phishing.
+
+At its validation-selected threshold (0.762), the ensemble measured 97.91%
+precision, 70.72% recall and 0.99% FPR on test. It meets the precision and FPR
+targets but still **fails the release gate**, whose recall bound requires 90%. The
+hostname alone does not carry enough signal for that. Inference time was measured
+for one hostname at a time on this workstation; the training run reported 5.0 ms.
 
 ## Evaluation and artifacts
 
