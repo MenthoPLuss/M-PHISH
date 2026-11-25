@@ -28,5 +28,6 @@
     "**/.venv": true,
     "**/package-lock.json": true,
     "docs/dependency-audit-*.json": true
-  }
+  },
+  "python.terminal.useEnvFile": true
 }
