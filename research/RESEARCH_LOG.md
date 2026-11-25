@@ -648,3 +648,104 @@ user.** The guardrail is not quietly relaxed.
   and C13.
 - No more training today. Next: calibration (H10) and the final build on C13. Then the pAUC
   objective (H2b, with `--patience 0 --select last` and a matching control), if wanted.
+
+## 2026-11-26
+
+### Plan — H10 calibration on C13 (post-hoc, no training), written before any result
+
+- **Scorers:** each C13 seed (42, 43, 44) and their 3-seed mean of logits. Scores come from
+  each run's saved `scores.npz`. Nothing is retrained.
+- **Calibrators:** none (σ(z)), temperature (σ(z/T)), Platt (σ(az+b), the format the app
+  already reads), and isotonic. Each is fitted on the calibration split (76,515 hostnames)
+  and judged on validation (75,961).
+- **Metrics:** validation log loss (primary), Brier score, ECE with 15 equal-width bins and
+  with 15 equal-count bins. Also per structural group: predicted vs observed phishing rate,
+  and ECE.
+- **Decision rule:** keep Platt unless another calibrator lowers validation log loss on all
+  three seeds, with the paired 95% interval excluding zero, and also lowers ECE. Isotonic
+  would also need a new artifact field, so its gain must justify a format change.
+- **Threshold under shift:** the production threshold rule is unchanged. Report:
+  - the 95% bootstrap interval of the threshold, re-selected on 1,000 resamples;
+  - the out-of-bag FPR and recall of those re-selected thresholds;
+  - the FPR at the chosen threshold on the calibration split. That split played no part in
+    choosing the threshold, so this is an independent check.
+  These are informational: they say how precisely an FPR can be promised. They are not a
+  gate.
+- **Ensemble:** the same read-out says whether the 3-seed mean is worth three times the size
+  (about 18 MB) for the final build. For C12, seed-ensembling added almost nothing.
+
+### H10 results — Platt kept; one website drives much of the operating-point noise
+
+Code: `research/hostname_cnn/calibration.py` (4 new tests, 18 pass). Report:
+`comparisons/H10_calibration__c13.json`. Run time 1.5 min, no training.
+
+**Calibrators (validation log loss; paired 95% interval vs Platt).**
+
+| Scorer | None | Temperature | Platt | Isotonic | Platt ECE → isotonic ECE |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Seed 42 | 0.3078 | 0.3061 | **0.3053** | 0.3066 (+0.0014 [+0.0008, +0.0019]) | 0.010 → 0.008 |
+| Seed 43 | 0.3031 | 0.3013 | 0.3006 | **0.3001** (−0.0006 [−0.0012, +0.0000]) | 0.013 → 0.007 |
+| Seed 44 | 0.3086 | 0.3069 | **0.3053** | 0.3058 (+0.0005 [−0.0001, +0.0011]) | 0.009 → 0.008 |
+| Mean of 3 | 0.3034 | 0.3012 | **0.2999** | 0.3002 (+0.0003 [−0.0003, +0.0008]) | 0.011 → 0.008 |
+
+- **Verdict: Platt kept, by the pre-registered rule.** Isotonic does not lower log loss on all
+  three seeds, and it is worse on seed 42. Its lower ECE does not justify a format change.
+- Temperature is worse than Platt on every scorer: the fitted intercept matters. The Platt
+  slope is about 1.2, so the raw model is slightly under-confident.
+- **Caveat for the app:** these probabilities are calibrated to the dataset's mix, which is
+  35% phishing. Real browsing has far less phishing, so a score of 0.85 is not an 85% chance
+  that a site is phishing. The threshold is what the app relies on, and it is not affected.
+
+**Threshold (Platt, mean of 3; the production rule).**
+- The threshold is 0.847. Validation FPR is 0.91% and recall 59.3%.
+- Re-selected on 1,000 resamples, the threshold stays in [0.834, 0.859]. The out-of-bag FPR of
+  the re-selected thresholds averages 0.92% [0.75, 1.12]; it is above 1% in 17% of resamples.
+- **Hostname resampling understates the uncertainty.** At the same threshold, the calibration
+  split gives an FPR of **0.59%** against 0.91% on validation. A hostname-level 95% interval
+  of [0.83, 0.99] cannot explain that gap.
+- **Cause: one website.** `yupoo.com`, a photo-hosting site with a subdomain per user, has
+  262 legitimate validation hostnames (0.5% of validation negatives). Splits go by registered
+  domain, so all of them are in validation; the calibration split has one yupoo hostname.
+  - Yupoo hostnames are **113 of 448 false alarms** for the mean of 3, and 191 of 448 for
+    seed 42.
+  - Without yupoo, validation FPR is 0.68%. The calibration split has no comparable cluster:
+    its 10 largest domains give 13 of 286 false alarms.
+  - Resampling registered domains instead of hostnames gives an FPR interval of
+    **[0.62, 1.40]**.
+- **What can be promised:** on held-out sites like these, the threshold gives an FPR of about
+  0.6–0.9%. A single site with many user subdomains can push it past 1%. The threshold rule
+  stays as pre-registered. It is conservative here, because it was tuned on the yupoo-heavy
+  validation.
+
+**Yupoo and the earlier decisions.**
+- Seed differences at fixed FPR are partly a yupoo effect. Seed 42 puts 204 of 262 yupoo
+  hostnames above its 1%-FPR cut; seed 43 puts 77. Without yupoo, seed 42's recall at 1% FPR
+  is 61.6% instead of 57.6%.
+- **The C13 decision is unaffected.** On the original validation hostnames (25 of them yupoo),
+  the 3-seed C13 − C12 means change little without yupoo: from −0.61 to −0.58 at 0.5% FPR,
+  and from −0.53 to −0.47 at 1% FPR.
+- **Lesson:** report fixed-FPR results with a by-site check. A single site can move them by
+  several points.
+
+**Ensemble vs single model (`diff__X-c13-ensemble-mean__...json`).** Each seed vs the 3-seed
+mean of logits, recall at 1% FPR:
+
+| Seed vs ensemble | All validation | Without yupoo |
+| --- | ---: | ---: |
+| Seed 42 | −2.45 [−3.19, −1.86] | −0.43 [−0.83, −0.01] |
+| Seed 43 | +0.84 [+0.44, +1.35] | −0.08 [−0.48, +0.41] |
+| Seed 44 | −1.29 [−1.63, −0.55] | −1.57 [−1.94, −1.04] |
+
+- The ensemble has the best ROC-AUC and log loss of all four scorers. Without yupoo, it
+  matches or beats every seed.
+- Seed 43's lead over the ensemble is a yupoo effect. Choosing it would select on validation
+  luck.
+- Unlike C12, ensembling C13 helps. Against a typical seed, the gain is about 0.7 pts of
+  recall at 1% FPR without yupoo, and it is steadier across sites.
+- **Cost:** three times the size (about 18 MB vs 6 MB) and the scoring time (about 6.6 ms vs
+  2.2 ms per hostname). The model is loaded by the backend only.
+- **Put to the user:** single model or 3-seed ensemble for the final build.
+
+**Decision (user, 2026-11-26): the final build is the 3-seed ensemble** (C13 seeds 42, 43
+and 44, mean of logits), with Platt calibration and the production threshold rule. It was
+chosen before the lockbox is opened.

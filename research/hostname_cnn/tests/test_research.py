@@ -230,3 +230,109 @@ def test_lockbox_is_sealed_without_the_phase_11_unlock(monkeypatch):
     monkeypatch.delenv("M_PHISH_LOCKBOX_UNLOCK", raising=False)
     with pytest.raises(PermissionError):
         lockbox.open_lockbox()
+
+
+def synthetic_logits(n=20000, slope=1.5, intercept=-0.4, seed=0):
+    """Logits z whose true phishing probability is sigmoid(slope * z + intercept)."""
+    rng = np.random.default_rng(seed)
+    z = rng.normal(0, 2, n)
+    y = (rng.random(n) < 1 / (1 + np.exp(-(slope * z + intercept)))).astype(int)
+    return z, y
+
+
+def test_calibrators_recover_the_true_mapping():
+    from research.hostname_cnn import calibration
+
+    z, y = synthetic_logits()
+    fitted = calibration.fit_calibrators(z, y)
+    platt = fitted["platt"][0]
+    assert abs(platt["slope"] - 1.5) < 0.1 and abs(platt["intercept"] + 0.4) < 0.1
+    zt, yt = synthetic_logits(seed=1)
+    truth = 1 / (1 + np.exp(-(1.5 * zt - 0.4)))
+    for method in ("platt", "isotonic"):
+        p = fitted[method][1](zt)
+        assert np.abs(p - truth).mean() < 0.03, method
+        assert calibration.adaptive_ece(yt, p) < 0.02, method
+    # An uncalibrated sigmoid of these logits is under-confident; temperature corrects it.
+    assert fitted["temperature"][0]["temperature"] < 1
+
+
+def test_adaptive_ece_is_zero_for_matching_rates_and_large_for_inverted():
+    from research.hostname_cnn import calibration
+
+    y = np.array([0, 1] * 500)
+    assert calibration.adaptive_ece(y, np.full(1000, 0.5)) == pytest.approx(0, abs=0.01)
+    assert calibration.adaptive_ece(y, np.where(y == 1, 0.0, 1.0)) > 0.9
+
+
+def test_threshold_stability_reports_fpr_near_the_rule_bound():
+    from research.hostname_cnn import calibration
+
+    z, y = synthetic_logits(n=30000)
+    p = 1 / (1 + np.exp(-z))
+    from backend.app.services.ml.train_url_cnn import select_threshold
+
+    t = select_threshold(y, p)
+    report = calibration.threshold_stability(y, p, t, y, p, bootstrap=30, seed=0)
+    assert report["validation"]["fpr"] <= 0.01
+    low, high = report["reselected_threshold_ci95"]
+    assert low <= t <= high
+    assert 0 < report["reselected_out_of_bag_fpr_mean"] < 0.02
+    assert report["calibration_split"] == report["validation"]
+
+
+def test_site_clustering_widens_the_interval_for_one_noisy_site():
+    from research.hostname_cnn import calibration
+
+    # 2,000 single-hostname legitimate sites with 1% false alarms, plus one site with 100
+    # hostnames that are all false alarms.
+    sites = np.array([f"site{i}.com" for i in range(2000)] + ["big.com"] * 100)
+    y = np.zeros(len(sites), int)
+    p = np.zeros(len(sites))
+    p[:20] = 1.0
+    p[2000:] = 1.0
+    report = calibration.site_clustering(y, p, 0.5, sites, bootstrap=300, seed=0)
+    assert report["false_alarms"] == 120
+    assert report["top_false_alarm_domains"][0] == {
+        "domain": "big.com",
+        "false_alarms": 100,
+        "legitimate": 100,
+    }
+    assert report["fpr_without_top_domain"] == pytest.approx(0.01)
+    low, high = report["domain_bootstrap_fpr_ci95"]
+    assert low < 0.03 and high > 0.08  # whole-site resampling sees the big site come and go
+
+
+def test_final_build_merge_scores_the_mean_of_its_members():
+    torch = pytest.importorskip("torch")
+    from research.hostname_cnn.final_build import merge_artifacts
+
+    config = models.defaults("v3wide") | {"channels": 8, "embedding_dim": 6, "hidden": 8}
+    config |= {"wide_buckets": 4096, "wide_max_n": 5}
+    X = models.features("v3wide", HOSTS, config)
+    singles = []
+    for seed in (1, 2, 3):
+        torch.manual_seed(seed)
+        model = models.build(torch, "v3wide", config)
+        train_one_step(torch, model, X)
+        singles.append(
+            {
+                "format": FORMAT,
+                "feature_version": FEATURE_VERSION,
+                "alphabet": "abc",
+                "config": models.runtime_config("v3wide", config),
+                "members": [models.export_tensors(model)],
+                "best_epochs": [seed],
+            }
+        )
+    merged = merge_artifacts(singles)
+    assert merged["best_epochs"] == [1, 2, 3]
+    assert merged["members"] == [s["members"][0] for s in singles]
+    runtime = V4Numpy(json.loads(json.dumps(merged)))
+    members = [V4Numpy(json.loads(json.dumps(s))) for s in singles]
+    for host in HOSTS:
+        expected = np.mean([m.logit(host) for m in members])
+        assert runtime.logit(host) == pytest.approx(expected, abs=1e-12)
+    other = dict(singles[1], config=dict(singles[1]["config"], hidden=9))
+    with pytest.raises(ValueError, match="config"):
+        merge_artifacts([singles[0], other])
