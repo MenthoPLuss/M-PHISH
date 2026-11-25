@@ -9,13 +9,22 @@ Research toward the next version of M-PHISH's hostname model. The deployed model
 - **Wave 1 (one seed per idea):** finished.
   - Promoted:
     - More legitimate training data (H1).
-    - Suffix dropout (H5b).
-    - Stacking the CNN with a character n-gram model (H4).
+    - Stacking the CNN with a character n-gram model (H4). Superseded by H12.
+  - Not confirmed on 3 seeds: suffix dropout (H5b).
   - Rejected: schedule and SWA (H3), checkpoint selection (H2a), focal loss (H2c), and
     structure inputs (H5a).
-- **In progress:**
-  - 3-seed confirmations.
-  - A Wide & Deep CNN (H12).
+- **Wave 2:** finished.
+  - **Wide & Deep CNN (H12): confirmed on 3 seeds.** It adds a linear path over hashed
+    character n-grams to the v3 CNN.
+    - Recall at 1% false-positive rate: +3.9 points.
+    - One model beats the deployed 3-member ensemble.
+- **Waves 3–4:** finished.
+  - **Wide & Deep on the H1 data:**
+    - Confirmed: false alarms on legitimate hosting-platform sites fall from about 37% to 14%.
+    - The cost: about 0.6 points of recall on the original validation set. That marginally
+      misses H1's pre-registered limit of 0.5, so adopting it is a product decision.
+    - Weighting the added data at one half does not change this trade-off.
+  - **Suffix dropout:** rejected on Wide & Deep too.
 - **Final test:** run once on a sealed set no earlier than 2026-12-08.
 
 Every decision, with its evidence, is in [`RESEARCH_LOG.md`](RESEARCH_LOG.md).

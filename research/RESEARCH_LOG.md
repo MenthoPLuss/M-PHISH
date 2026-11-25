@@ -304,3 +304,347 @@ Recall columns are percentage points.
 - **Leftover queue process.** The first lane-B2 shell, stopped before relaunch, outlived
   TaskStop. It re-read the rewritten script after its wait loop, hit a syntax error and
   exited without running anything. The run-id guard would have refused duplicates anyway.
+
+## 2026-11-25
+
+### 01:10 — H12 Wide & Deep: largest gain so far; C5b seed 42 weak; work moved to E:
+
+**E12-v3wide-s42** (screen, bucketed, seed 42). Early stop at epoch 18; epoch 13 chosen. NumPy
+parity is 1.1e-6. Paired bootstrap on the 62,045 validation hostnames; recall in percentage points.
+
+| E12 vs | ROC-AUC | pAUC | Recall at 0.5% FPR | Recall at 1% FPR |
+| --- | --- | --- | --- | --- |
+| Seed-matched control (identical at step 0) | +0.0140 [+0.0122, +0.0153] | +0.0324 [+0.0263, +0.0385] | +4.23 [+3.25, +5.44] | +2.98 [+2.26, +3.90] |
+| Deployed 3-member ensemble | +0.0062 [+0.0047, +0.0074] | +0.0101 [+0.0060, +0.0139] | +2.19 [+1.40, +3.14] | +1.33 [+0.59, +2.14] |
+| Post-hoc stack (control + E4 n-gram) | −0.0026 [−0.0035, −0.0017] | +0.0049 [+0.0014, +0.0084] | +1.60 [+0.69, +2.74] | +0.10 [−0.62, +0.92] |
+
+- **Size of the gain.** Against the control it is 5–7 training SDs at the operating point, far
+  beyond the bucketed control's tail luck. One Wide & Deep model beats the 3-member ensemble.
+- **Joint training vs stacking.** Joint training matches or beats post-hoc stacking at the
+  operating point with one artifact, so the single-artifact inference contract holds.
+- **Memorisation check passed (`comparisons/H12_memorisation_and_ablation.json`).** On the
+  57,076 stem-unseen hostnames, E12 vs the ensemble gives recall +2.17 pts [+0.99, +3.04] at
+  0.5% FPR and +1.04 [+0.27, +1.98] at 1% FPR. Vs the control it gives +4.04 and +3.14. The
+  wide path memorises seen stems (vs the control, recall at 0.5% FPR +32 pts on stem-seen),
+  but the gain on unseen stems stands on its own.
+- **Ablation.** The two paths specialised; the deep path is not lazy.
+
+  | Path | ROC-AUC | Recall at 1% FPR |
+  | --- | ---: | ---: |
+  | Deep path alone | 0.873 | 54.0% |
+  | Wide path alone | 0.894 | 52.9% |
+  | Control CNN | 0.902 | 59.4% |
+  | Both paths | 0.916 | 62.4% |
+
+  Logit correlation between the paths is 0.70. **Risk:** the deep path now relies on the wide
+  path's lexical memory. If phishing vocabulary drifts, both could degrade together. The
+  temporal lockbox (≥ 2026-12-08) is the test.
+- **Platform false alarms barely change.** At 59% recall: shared legitimate FPR 0.95% → 0.63%
+  (−0.32 [−0.42, −0.24]); platform-legitimate (added, n=774) 43.0% → 38.8%; long-legitimate
+  11.4% → 7.4%. H1's data fix brought platform-legitimate to 18.9%, so the two address
+  different failures. **Next: E13 = Wide & Deep on h1-v2 (forward selection).**
+
+**C5b-suffixdrop0.2-random-s42** (confirmation, random batches). The screen's gain mostly
+does not reproduce.
+
+| vs | ROC-AUC | pAUC | Recall at 0.5% FPR | Recall at 1% FPR |
+| --- | --- | --- | --- | --- |
+| P0.5-control-random-s42 | −0.0020 [−0.0031, −0.0006] | +0.0048 [−0.0008, +0.0108] | +0.45 [−0.83, +1.68] | +1.06 [+0.07, +1.72] |
+| P0-production-member-s42 | −0.0010 [−0.0022, +0.0002] | +0.0057 [−0.0002, +0.0112] | −0.62 [−2.05, +1.00] | +0.71 [−0.16, +1.39] |
+
+This is the inflation the 23:45 caveat warned about: E5b was judged against the unlucky
+bucketed control. **H5b is downgraded to "not confirmed; at most a small effect at 1% FPR".**
+Its seeds 43 and 44 move behind the Wide & Deep work. Suffix dropout can still be tried as an
+add-on to Wide & Deep in forward selection.
+
+**Wave 2 (from E:, both runs record git d7bf21c, clean):**
+- Lane A: `C12-v3wide-random-s42`, then `-s43`.
+- Lane B: `E13-v3wide-h1v2-s42` (screen vs E12, both bucketed seed 42), then
+  `C12-v3wide-random-s44`.
+
+**Housekeeping.**
+- The workspace moved to `E:\M-PHISH-vscode (1)`; C: was full.
+- The final sync copied the runs: 30 files, 0 failed. E: holds everything; it also keeps 217
+  completed-run checkpoints that were removed from C: as verified duplicates.
+- This log moved into the repository (`research/RESEARCH_LOG.md`).
+- Commit `d7bf21c` pushed as `mine/cnn-v4-research`; CI "Verify and package" passed.
+
+### 05:05 — H12 confirmed on 3 seeds; E13 (H12 + H1) fixes platform false alarms
+
+All four wave-2 runs exited 0 and record git `d7bf21c` with clean code. NumPy parity is
+1.0–1.7e-6. Paired bootstrap (500) on the 62,045 validation hostnames; recall in points.
+
+**H12 Wide & Deep is confirmed (random batches, seeds 42–44).**
+
+| Seed | Chosen epoch | ROC-AUC | pAUC | Recall at 0.5% FPR | Recall at 1% FPR |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 42 | 16 | 0.9170 | 0.7793 | 58.8% | 63.8% |
+| 43 | 15 | 0.9179 | 0.7771 | 58.1% | 63.2% |
+| 44 | 14 | 0.9162 | 0.7773 | 58.1% | 62.4% |
+| Mean (SD) | | 0.9170 (0.0009) | 0.7779 (0.0012) | 58.3% (0.4) | 63.2% (0.7) |
+| Random-batch controls, mean of 4 (SD) | | 0.9031 (0.0006) | 0.7495 (0.0035) | 53.7% (0.6) | 59.3% (0.6) |
+
+Against each seed-matched control (`diff__P0-production-member-s*__C12-*.json`):
+
+| Seed | ROC-AUC | pAUC | Recall at 0.5% FPR | Recall at 1% FPR |
+| --- | --- | --- | --- | --- |
+| 42 vs production member | +0.0146 [+0.0129, +0.0161] | +0.0331 [+0.0265, +0.0399] | +5.00 [+3.53, +6.46] | +4.45 [+3.69, +5.36] |
+| 42 vs research control | +0.0137 [+0.0120, +0.0151] | +0.0323 [+0.0259, +0.0388] | +6.07 [+4.72, +7.24] | +4.79 [+3.95, +5.60] |
+| 43 vs production member | +0.0141 [+0.0124, +0.0157] | +0.0257 [+0.0202, +0.0324] | +3.90 [+2.78, +5.25] | +2.99 [+2.40, +3.88] |
+| 44 vs production member | +0.0134 [+0.0117, +0.0149] | +0.0240 [+0.0194, +0.0285] | +4.14 [+3.19, +4.98] | +3.76 [+3.06, +4.61] |
+
+- **Verdict: promoted; Wide & Deep becomes the base for forward selection.** All 3 seeds clear
+  the rule on every primary metric. The mean gains are +0.0139 ROC-AUC (about 23 training SDs),
+  +4.6 pts at 0.5% FPR (about 8 SDs) and +3.9 pts at 1% FPR (about 6 SDs). The bucketed screen
+  (E12: +4.23 and +2.98) was not inflated.
+- **Ensembles (`combine__c12-ensemble-mean.json`).**
+
+  | Comparison | ROC-AUC | Recall at 0.5% FPR | Recall at 1% FPR |
+  | --- | --- | --- | --- |
+  | One Wide & Deep model (s42) vs deployed 3-member ensemble | +0.0072 [+0.0056, +0.0084] | +3.44 [+2.40, +4.46] | +2.75 [+2.03, +3.63] |
+  | 3-member Wide & Deep ensemble vs deployed 3-member ensemble | +0.0086 [+0.0070, +0.0098] | +2.69 [+1.99, +4.11] | +2.73 [+1.99, +3.53] |
+  | 3-member Wide & Deep ensemble vs deployed ensemble + n-gram stack | −0.0006 [−0.0015, +0.0003] | +1.15 [+0.37, +2.63] | +0.94 [+0.34, +1.74] |
+
+  Seed-ensembling Wide & Deep adds almost nothing: ROC-AUC 0.9184 vs best single 0.9179, and
+  recall at 1% FPR 63.8% vs 63.8%. The members agree too closely: pairwise logit correlation is
+  0.990, against 0.963–0.968 for the deployed members. A likely reason: for a fixed deep path
+  the linear path's loss is convex and starts at zero for every seed, so it ends in nearly the
+  same place. The seeds then differ mainly through the deep path. This is not tested.
+  **Consequence:** one Wide & Deep artifact (about 6 MB) does the work of a 3-member ensemble.
+  That is relevant to the final ensemble phase and to deployment, which stays the user's
+  decision.
+
+**E13-v3wide-h1v2-s42 (screen: Wide & Deep on h1-v2, vs E12, both bucketed seed 42).**
+
+- **Shared hostnames: neutral.** ROC-AUC −0.0012 [−0.0019, −0.0006]; pAUC −0.0002
+  [−0.0039, +0.0038]; recall at 0.5% FPR −0.20 [−1.53, +0.76]; at 1% FPR +0.10 [−0.63, +0.75].
+  The AUC cost is about 2 training SDs. On the v3 CNN the same data cost −0.0059 (E1), so Wide &
+  Deep absorbs most of H1's ranking cost. E13's own validation ROC-AUC (0.9274) includes the
+  added legitimate hostnames and is not comparable.
+- **Fixed recall 59% on the shared phishing (`fixed_recall__E12-v3wide-s42__E13-v3wide-h1v2-s42.json`).**
+
+  | False positive rate | Bucketed control | E1 (v3 + h1-v2) | E12 (Wide & Deep) | E13 (both) | E13 − E12 [95% CI] |
+  | --- | ---: | ---: | ---: | ---: | --- |
+  | Shared legitimate (35,308) | 0.95% | 0.90% | 0.63% | 0.62% | −0.01 [−0.08, +0.07] |
+  | Added legitimate, hosting platform (774) | 43.0% | 18.9% | 38.8% | **16.4%** | −22.35 [−25.19, −19.44] |
+  | Shared legitimate, hosting platform (137) | 43.8% | 16.1% | 35.8% | 11.7% | −24.09 [−31.39, −16.79] |
+  | Added legitimate, longer than 30 (2,484) | 11.4% | 4.9% | 7.4% | 2.6% | −4.79 [−5.72, −3.90] |
+  | Added legitimate, 4+ labels (11,979) | — | — | 2.4% | 1.2% | −1.19 [−1.38, −0.97] |
+
+  At 50% recall: platform-legitimate (added) 19.9% → 6.5%.
+- **The cost is where expected.** Recall is fixed overall, so it moves between groups.
+  - Phishing on hosting platforms (8,799, a third of the shared phishing): 98.7% → 95.4%
+    (−3.26 [−3.63, −2.81]). E1 paid the same (98.5% → 94.4%).
+  - Long phishing (6,575): 94.1% → 92.2%.
+  - 4+ label phishing (4,461): 91.0% → 87.8%.
+
+  Before, being on a hosting platform was almost enough to be flagged. Now the subdomain itself
+  has to look like phishing.
+- **Verdict: promoted to 3-seed confirmation.** H1's pre-registered target is met: platform
+  false alarms fall by more than half with recall held. E13 also beats E1 on that target, and
+  keeps E12's operating-point gains on the shared hostnames.
+
+**Wave 3 (from E:, git `d7bf21c`, clean code; started 05:05):**
+- Lane A: `C13-v3wide-h1v2-random-s42`, then `-s43`.
+- Lane B: `C13-v3wide-h1v2-random-s44`, then the next forward-selection screen,
+  `E14-v3wide-h1v2-suffixdrop0.2-s42` (E13 + suffix dropout 0.2; bucketed, vs E13). Its
+  rationale: the audit found that the TLD alone swings decisions (.xyz +0.60). Suffix dropout
+  hides the suffix characters from both paths for 20% of hostnames. On v3 it was not confirmed
+  (C5b).
+- C13 seed *N* is judged against C12 seed *N*: the same recipe and seed, only the data differs.
+  C12 has been scored on the hostnames h1-v2 adds (`score --only-new`), so the fixed-recall
+  read-out is paired per seed.
+
+### 08:45 — C13 breaches H1's recall guardrail on 2 of 3 seeds; E14 suffix dropout recovers it in the screen
+
+All runs exited 0, git `d7bf21c`, clean code, parity ≤ 1.5e-6. Seed 43 of C13 is still running.
+
+**C13 seed *N* vs C12 seed *N*** (random batches; only the dataset differs). Primary metrics on
+the 62,045 original validation hostnames (`diff__C12-*__C13-*.json`):
+
+| Seed | ROC-AUC | pAUC | Recall at 0.5% FPR | Recall at 1% FPR |
+| --- | --- | --- | --- | --- |
+| 42 | −0.0023 [−0.0031, −0.0016] | −0.0039 [−0.0074, −0.0000] | −1.13 [−2.09, +0.08] | −1.24 [−1.81, −0.55] |
+| 44 | −0.0028 [−0.0035, −0.0020] | −0.0064 [−0.0106, −0.0022] | −1.62 [−2.35, −0.42] | −0.43 [−1.30, +0.17] |
+
+Fixed recall 59% on the shared phishing (`fixed_recall__C12-*__C13-*.json`):
+
+| Seed | Shared legitimate FPR | Platform legitimate (added, 774) | Long legitimate (added, 2,484) | Platform phishing recall |
+| --- | --- | --- | --- | --- |
+| 42 | 0.51% → 0.61% (+0.09 [+0.02, +0.17]) | 35.0% → 14.2% (−20.8) | 6.9% → 2.3% | 98.4% → 95.1% |
+| 44 | 0.58% → 0.69% (+0.11 [+0.03, +0.19]) | 38.6% → 16.2% (−22.5) | 7.0% → 2.8% | 98.6% → 95.6% |
+
+- **The platform fix replicates exactly.** False alarms on legitimate hosting-platform sites
+  fall by about 21 pts on both seeds.
+- **H1's pre-registered guardrail is breached on both seeds.** The rule: recall at the
+  operating point may fall by at most 0.5 pts on the original validation. Seed 42 is at −1.13
+  and −1.24; seed 44 is at −1.62 at 0.5% FPR. The bucketed screen (E13 vs E12) had shown no
+  cost, so random batches reveal one the screen hid.
+- **Caveat, not an excuse.** The original validation has only 137 legitimate platform sites
+  among 35,308. Its FPR therefore barely counts the population H1 fixes. At 59% recall, the
+  seed-42 trade breaks even if just 0.5% of legitimate traffic is on hosting platforms:
+  0.10 pts more shared FPR against 20.8 pts less platform FPR. Real browsing likely exceeds
+  that, but no traffic data here measures it. The guardrail stands as registered: H1 on Wide &
+  Deep is **not promoted alone**. Accepting the trade would be a product decision for the user.
+- Verdict after seed 43.
+
+**E14-v3wide-h1v2-suffixdrop0.2-s42 vs E13** (screen, both bucketed seed 42, both trained on
+h1-v2; scratch analysis `e14_vs_e13.py` with the added hostnames read as in `fixed-recall`;
+`diff__E13-*__E14-*__original-hosts.json`, `fixed_recall__E13-*__E14-*.json`).
+
+| Metric (original 62,045 hostnames) | E14 − E13 [95% CI] |
+| --- | --- |
+| ROC-AUC | −0.0014 [−0.0019, −0.0007] |
+| pAUC | +0.0049 [+0.0020, +0.0077] |
+| Recall at 0.5% FPR | +1.55 [+0.49, +2.51] |
+| Recall at 1% FPR | +0.61 [+0.02, +1.21] |
+
+| At 59% recall | E13 | E14 | Difference [95% CI] |
+| --- | ---: | ---: | --- |
+| Shared legitimate FPR | 0.62% | 0.52% | −0.10 [−0.16, −0.03] |
+| Platform legitimate (added) | 16.4% | 13.2% | −3.23 [−4.78, −1.16] |
+| 4+ labels legitimate (added) | 1.19% | 0.42% | −0.78 [−0.94, −0.60] |
+| Platform phishing recall | 95.4% | 94.9% | −0.50 [−0.85, −0.23] |
+
+- On the rule, recall at 0.5% FPR passes (+1.55 > 2 SD, CI excludes 0); at 1% it does not
+  (+0.61). ROC-AUC dips by about 2 SD, like C5b's (−0.0020). This is the same pattern as E5b,
+  whose screen did not survive confirmation. So it is not promoted on the screen alone.
+- **Why it is confirmed now anyway.** It works against exactly what breaches H1's guardrail.
+  The shared-legitimate FPR that h1-v2 raised by 0.1 pts falls by 0.1 pts. Hiding the suffix
+  for 20% of hostnames is meant to stop the model leaning on the TLD. Whether that is the
+  mechanism behind h1-v2's cost is a hypothesis, not tested.
+- The scratch analysis is saved next to its output as
+  `runs/research/comparisons/e14_vs_e13.py`. It becomes a `compare` option once no run is
+  in flight, since a code change now would mark the queued run as dirty.
+
+**09:25: C13 seed 43, and the 3-seed verdict on H1 over Wide & Deep.** Seed 43 vs C12 seed 43:
+ROC-AUC −0.0025 [−0.0033, −0.0017]; recall at 0.5% FPR +0.93 [−0.83, +1.74]; at 1% FPR +0.08
+[−0.77, +0.77]. At 59% recall: shared legitimate FPR 0.54% → 0.50%; platform legitimate
+36.6% → 12.9%; platform phishing recall 98.5% → 94.8%.
+
+| C13 − C12, original validation | Seed 42 | Seed 43 | Seed 44 | Mean (SE) |
+| --- | ---: | ---: | ---: | ---: |
+| ROC-AUC | −0.0023 | −0.0025 | −0.0028 | −0.0025 (0.0001) |
+| Recall at 0.5% FPR | −1.13 | +0.93 | −1.62 | −0.61 (0.78) |
+| Recall at 1% FPR | −1.24 | +0.08 | −0.43 | −0.53 (0.38) |
+| Shared legitimate FPR at 59% recall | +0.09 | −0.04 | +0.11 | +0.05 (0.05) |
+| Platform legitimate FPR at 59% recall | −20.8 | −23.6 | −22.5 | −22.3 (0.8) |
+| Platform phishing recall at 59% recall | −3.27 | −3.74 | −2.97 | −3.33 (0.22) |
+
+- **Verdict: H1 over Wide & Deep is a marginal fail of its guardrail, not promoted alone.** The
+  3-seed mean is past the −0.5 pts limit at both operating points (−0.61, −0.53), but within
+  its own uncertainty. The platform fix is large and stable (−22 pts, SE 0.8). The ROC-AUC
+  cost is small but certain. The decision moves to C14 (with suffix dropout).
+
+**Wave 4 (started 08:45; git `d7bf21c`, clean code):** confirm E14 with random batches.
+- Lane B: `C14-v3wide-h1v2-suffixdrop0.2-random-s42`, then `-s44`.
+- Lane A: after C13 seed 43, `C14-...-s43`.
+- Each C14 seed *N* is judged against C12 seed *N*, to test whether the full combination
+  passes H1's guardrail against the confirmed base. It is also judged against C13 seed *N*, to
+  isolate suffix dropout.
+
+### 11:25 — C14 seed 43: suffix dropout hurts; H1 at half weight queued
+
+`C14-v3wide-h1v2-suffixdrop0.2-random-s43` (chosen epoch 13; parity 2.2e-6).
+
+| C14 seed 43 vs | ROC-AUC | pAUC | Recall at 0.5% FPR | Recall at 1% FPR | Shared legitimate FPR at 59% recall |
+| --- | --- | --- | --- | --- | --- |
+| C12 seed 43 (guardrail) | −0.0033 [−0.0042, −0.0025] | −0.0036 [−0.0078, +0.0002] | −0.73 [−2.06, +0.27] | −1.38 [−2.16, −0.75] | 0.54% → 0.63% |
+| C13 seed 43 (suffix dropout alone) | −0.0008 [−0.0014, −0.0002] | −0.0045 [−0.0077, −0.0014] | −1.66 [−2.26, −0.45] | −1.46 [−2.10, −0.85] | 0.50% → 0.63% |
+
+- Against C13, suffix dropout moves every primary metric the wrong way, beyond 2 SD at both
+  operating points. It also undoes part of the platform fix: 12.9% → 15.5%. The E14 screen's
+  +1.55 does not reproduce, the same as E5b → C5b on v3. Seeds 42 and 44 are still running,
+  so the verdict waits. If they agree, this is the second time a suffix-dropout screen has
+  failed to replicate. Bucketed screens are not reliable for this kind of regulariser.
+
+**12:15: C14 seed 42** (chosen epoch 21; parity 1.6e-6).
+- Against C12 seed 42, it breaches the guardrail: ROC-AUC −0.0033 [−0.0042, −0.0025]; recall
+  at 0.5% FPR −0.77 [−2.15, +0.37]; at 1% FPR −1.62 [−2.41, −0.92]. Platform legitimate FPR is
+  35.0% → 12.1%.
+- Against C13 seed 42 (suffix dropout alone) it is neutral: ROC-AUC −0.0010 [−0.0016, −0.0004];
+  recall at 0.5% FPR +0.36 [−0.71, +1.05]; at 1% FPR −0.37 [−1.08, +0.23]. Platform FPR is
+  14.2% → 12.1%.
+- With seed 43 negative and seed 42 neutral, suffix dropout cannot reach a 3-seed gain.
+  Seed 44 is finishing for completeness.
+
+**E15-v3wide-h1v2-w0.5-random-s42 (lane A, 11:25; git `d7bf21c`, clean code).**
+- **Limitation:** H1 brings a cost. Phishing recall falls in exactly the groups the added
+  legitimate rows resemble:
+  - 4+ labels: −2.3 to −4.4 pts.
+  - Long: −2.0 to −2.5 pts.
+  - Platform: −3.0 to −3.7 pts.
+
+  Most of the 49,360 added training rows are 4+-label or long legitimate hostnames under ICANN
+  suffixes (46,573). Only 2,787 are on hosting platforms. The platform fix needs the
+  platform rows; the volume of the others may be what moves the boundary for deep and long
+  phishing.
+- **Why weighting should help:** halving the loss weight of the added rows halves their pull on
+  the decision boundary. Their evidence still points the same way. Weights are normalised to
+  mean 1: original rows 1.19, added 0.60. The training step size is unchanged, and the weights
+  enter the loss only, so the random-number stream is identical to C13 seed 42.
+- **Experiment:** C13 seed 42 with `--sample-weights data/feeds/research/h1-v2/added-train-weights-0.5.json`.
+  It is judged against C12 seed 42 for the guardrail (C13 there: −1.13 and −1.24) and C13
+  seed 42 for the platform fix (14.2%).
+- **Could go wrong:** the platform fix shrinks along with the cost. Weighting is also a knob
+  tuned on validation. If it is adopted, the weight must be fixed before the lockbox and not
+  re-tuned on it.
+- **Metric:** recall at 0.5% and 1% FPR vs C12 seed 42 (limit −0.5 pts), and platform-legitimate
+  FPR at 59% recall vs C12 seed 42 (H1's target: halve it, so at most about 17.5%).
+
+### 13:45 — wave 4 verdicts: suffix dropout rejected on Wide & Deep; H1 weighting does not help
+
+All runs exited 0, git `d7bf21c`, clean code, parity ≤ 2.2e-6. No run is in flight.
+
+**H5b suffix dropout on Wide & Deep + h1-v2: rejected.** C14 seed 44 (chosen epoch 14):
+- vs C12 seed 44: ROC-AUC −0.0027; recall at 0.5% FPR −1.23 [−1.99, −0.06]; at 1% −0.25.
+- vs C13 seed 44: ROC-AUC +0.0001; recall at 0.5% FPR +0.39 [−0.32, +1.20]; at 1% +0.17.
+  Platform FPR unchanged (16.2%).
+
+| C14 − C13 (suffix dropout alone) | Seed 42 | Seed 43 | Seed 44 | Mean |
+| --- | ---: | ---: | ---: | ---: |
+| ROC-AUC | −0.0010 | −0.0008 | +0.0001 | −0.0006 |
+| Recall at 0.5% FPR | +0.36 | −1.66 | +0.39 | −0.30 |
+| Recall at 1% FPR | −0.37 | −1.46 | +0.17 | −0.55 |
+| Platform legitimate FPR at 59% recall | −2.1 | +2.6 | 0.0 | +0.2 |
+
+There is no gain on any seed beyond noise, and one seed is clearly worse. Against the guardrail
+base C12, C14 averages −0.91 and −1.08: worse than C13. The E14 screen's +1.55 was the second
+suffix-dropout screen to fail to replicate. **Lesson recorded:** bucketed one-seed screens
+over-state regularisers. For future regulariser ideas, screen with random batches against
+an existing seed-matched random run, as E15 does.
+
+**E15 (H1 at half weight, seed 42, chosen epoch 16): not useful.**
+
+| E15 vs | ROC-AUC | Recall at 0.5% FPR | Recall at 1% FPR | Platform legitimate FPR at 59% recall | Platform phishing recall |
+| --- | --- | --- | --- | --- | --- |
+| C12 seed 42 (no h1-v2) | −0.0022 [−0.0028, −0.0015] | −0.41 [−1.35, +0.70] | −1.23 [−1.88, −0.73] | 35.0% → 19.4% | 98.4% → 96.4% |
+| C13 seed 42 (full weight) | +0.0002 [−0.0003, +0.0007] | +0.71 [−0.02, +1.36] | +0.01 [−0.58, +0.35] | 14.2% → 19.4% | 95.1% → 96.4% |
+
+- Half weight gives back a quarter of the platform fix: 19.4% misses H1's "halve it" target
+  of 17.5%.
+- The recall cost at 1% FPR stays the same (−1.23 vs −1.24).
+- 4+-label phishing recall recovers (−0.45 vs −2.31 at full weight), as the hypothesis
+  predicted. That does not reach the primary metric.
+- **Not pursued.** The cost at the operating point does not scale with the added rows' weight,
+  so it is not simply their volume. Weighting only moves along the same trade-off.
+
+**State of the candidates (validation only; the lockbox is still sealed).**
+
+| Recipe | Status | vs deployed members, recall at 1% FPR | Platform legitimate FPR at 59% recall |
+| --- | --- | ---: | ---: |
+| C12: Wide & Deep, original data | **Confirmed** (3 seeds) | +3.9 pts | ≈ 37% |
+| C13: Wide & Deep + h1-v2 | Platform fix confirmed (−22 pts); marginally fails H1's recall guardrail (−0.61 / −0.53) | ≈ +3.3 pts | ≈ 14% |
+
+Whether the platform fix is worth about 0.6 pts of recall on the original validation, a set
+with 137 legitimate platform sites among 35,308, is a product decision. **It is put to the
+user.** The guardrail is not quietly relaxed.
+
+**Decision (user, 13:50): recipe C13 (Wide & Deep + h1-v2) goes forward to the final stage.**
+- The user accepted the trade over H1's pre-registered limit of −0.5 pts: the 3-seed mean is
+  −0.61 at 0.5% FPR and −0.53 at 1% FPR.
+- Reason: fewer false alarms on legitimate hosting-platform sites people actually visit.
+- This was decided before the lockbox is opened. The lockbox is not used to choose between C12
+  and C13.
+- No more training today. Next: calibration (H10) and the final build on C13. Then the pAUC
+  objective (H2b, with `--patience 0 --select last` and a matching control), if wanted.
