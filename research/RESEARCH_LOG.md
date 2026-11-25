@@ -749,3 +749,39 @@ mean of logits, recall at 1% FPR:
 **Decision (user, 2026-11-26): the final build is the 3-seed ensemble** (C13 seeds 42, 43
 and 44, mean of logits), with Platt calibration and the production threshold rule. It was
 chosen before the lockbox is opened.
+
+### Final build: `F-c13-ensemble3` (validation only; the lockbox is still sealed)
+
+Built by `final_build.py` at git `c49568a` (clean code) in 2.3 min. Nothing was retrained.
+The members are copied unchanged from the C13 runs (chosen epochs 14, 17 and 15).
+
+| Item | Value |
+| --- | --- |
+| Members | C13 seeds 42, 43, 44; mean of logits |
+| Calibration | Platt on the calibration split: slope and intercept in `experiment.json` |
+| Threshold | 0.8466 (production rule on validation) |
+| Validation at threshold | FPR 0.91%, recall 59.3% |
+| Calibration split at threshold | FPR 0.59%, recall 62.4% |
+| FPR 95% interval, resampling sites | [0.62, 1.40]; 0.68% without yupoo.com |
+| Hosting-platform legitimate FPR at threshold | 13.8% (ICANN suffixes: 0.67%) |
+| NumPy parity | 1.8e-6 on all 76,515 calibration and 75,961 validation hostnames |
+| Scoring time | 2.9 ms per hostname (one process) |
+| Artifact | 18.2 MB, format `m-phish-charcnn-v4-research` (the app refuses it by design) |
+
+**Against the deployed `cnn-v3-fresh` ensemble** (`diff__X-prod-ensemble-mean__F-c13-ensemble3.json`,
+62,045 shared validation hostnames):
+
+| Metric | Difference |
+| --- | --- |
+| ROC-AUC | +0.0064 [+0.0049, +0.0078] |
+| pAUC (FPR ≤ 1%) | +0.0154 [+0.0100, +0.0210] |
+| Recall at 0.1% FPR | +3.19 pts [+0.77, +6.19] |
+| Recall at 0.5% FPR | +2.89 pts [+1.77, +4.19] |
+| Recall at 1% FPR | +2.32 pts [+1.22, +3.24] |
+
+**Still to do:**
+1. The sealed final test (Phase 11), on snapshots taken on or after 2026-12-08: score
+   `F-c13-ensemble3` once, with no changes after.
+2. A production format and loader in the backend, if the user wants to deploy it. The app is
+   out of scope for this research.
+3. Optional: the pAUC objective (H2b), with a matching control.
