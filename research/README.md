@@ -33,6 +33,13 @@ Research toward the next version of M-PHISH's hostname model. The deployed model
   H1 data.
   - Recall at 1% false-positive rate: +2.3 points over the deployed model (validation only).
   - 18 MB; 2.9 ms per hostname.
+- **Backend loader (2026-11-27):** the app can now run the final build, but does not by
+  default.
+  - New format `m-phish-charcnn-v3-wide`: the v3 network plus one n-gram table per member.
+  - `export_production.py` writes `runs/cnn-v3wide-c13-ensemble3/url_cnn.json`. The app's
+    logits are identical to the build's on all 152,476 calibration and validation
+    hostnames.
+  - The app still serves `cnn-v3-fresh`. To switch, see `docs/URL_CNN_V3.md`.
 - **Final test:** run once on a sealed set no earlier than 2026-12-08.
 
 Every decision, with its evidence, is in [`RESEARCH_LOG.md`](RESEARCH_LOG.md).
@@ -49,6 +56,7 @@ Every decision, with its evidence, is in [`RESEARCH_LOG.md`](RESEARCH_LOG.md).
 | `hostname_cnn/datasets.py`, `ngram.py`, `lockbox.py` | Dataset variants, the n-gram baseline, and the sealed test set |
 | `hostname_cnn/calibration.py` | H10: calibrator comparison, threshold stability, false alarms by site |
 | `hostname_cnn/final_build.py` | Merges finished runs into one ensemble artifact and checks it on every hostname |
+| `hostname_cnn/export_production.py` | Converts a final build to the app's `m-phish-charcnn-v3-wide` format and checks the app's loader on every hostname |
 | `hostname_cnn/tests/` | Tests for parity, invariances, metrics and safeguards |
 
 ## Running
@@ -61,6 +69,7 @@ python -m research.hostname_cnn.train --exp-id <id> --hypothesis <H> [options]
 python -m research.hostname_cnn.compare diff --control <run> --candidates <run> ...
 python -m research.hostname_cnn.calibration --name <name> --runs <run> ...
 python -m research.hostname_cnn.final_build --name <name> --runs <run> ...
+python -m research.hostname_cnn.export_production --build F-<name>
 ```
 
 Runs are written to `runs/research/<id>/`. That folder and the datasets under `data/feeds/`

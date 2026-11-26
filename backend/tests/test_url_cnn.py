@@ -370,3 +370,150 @@ def test_v2_export_matches_pytorch_with_folded_batch_norm(tmp_path):
         expected = model(torch.from_numpy(model_features(texts, "v2", 64))).numpy()
     for text, value in zip(texts, expected, strict=True):
         assert loaded.logit(text) == pytest.approx(float(value), abs=1e-4)
+
+
+# ---------------------------------------------------------------- v3-wide (Wide & Deep)
+
+V3 = {"max_length": 40, "embedding_dim": 4, "channels": 6, "kernel_size": 3, "hidden": 5}
+V3_DILATIONS = [1, 2]
+WIDE_BUCKETS, WIDE_MAX_N = 97, 4
+
+
+def v3_member(rng, wide=None):
+    e, c, k, h = V3["embedding_dim"], V3["channels"], V3["kernel_size"], V3["hidden"]
+
+    def r(*shape):
+        return rng.normal(0, 0.5, shape).astype(np.float32)
+
+    def pair(weight_shape, bias_shape):
+        return {"weight": r(*weight_shape), "bias": r(*bias_shape)}
+
+    member = {
+        "embedding": r(VOCAB_SIZE, e),
+        "role_embedding": r(url_cnn.ROLE_COUNT, e),
+        "stem": pair((c, e, k), (c,)),
+        "norm": pair((c,), (c,)),
+        "blocks": [
+            {
+                "depthwise": pair((c, 1, k), (c,)),
+                "norm": pair((c,), (c,)),
+                "gate": pair((2 * c, c, 1), (2 * c,)),
+                "scale": r(c),
+            }
+            for _ in V3_DILATIONS
+        ],
+        "attention": pair((1, c, 1), (1,)),
+        "dense": pair((h, 4 * c), (h,)),
+        "out": pair((1, h), (1,)),
+    }
+    if wide is not None:
+        member["wide"] = wide
+    return member
+
+
+def v3_artifact(members, wide=False, gate="passed"):
+    data = V3 | {
+        "format": url_cnn.ARTIFACT_FORMAT_V3_WIDE if wide else url_cnn.ARTIFACT_FORMAT_V3,
+        "feature_version": (
+            url_cnn.FEATURE_VERSION_V3_WIDE if wide else url_cnn.FEATURE_VERSION_V3
+        ),
+        "alphabet": ALPHABET,
+        "model_version": "test-v3",
+        "release_gate": gate,
+        "dilations": V3_DILATIONS,
+        "members": [pack_member(m) for m in members],
+        "calibration_slope": 1.0,
+        "calibration_intercept": 0.0,
+        "threshold": 0.5,
+    }
+    if wide:
+        data |= {"wide_buckets": WIDE_BUCKETS, "wide_max_n": WIDE_MAX_N}
+    return data
+
+
+def reference_wide_term(table, text):
+    """Deliberately naive: every unpadded n-gram, hashed exactly as documented."""
+    length = min(V3["max_length"], len(text))
+    chars, roles = encode(text, length), url_cnn.encode_roles(text, length)
+    weights = []
+    for n in range(1, WIDE_MAX_N + 1):
+        for t in range(length - n + 1):
+            if any(chars[t + j] == url_cnn.PAD for j in range(n)):
+                continue
+            key = int(roles[t])
+            for j in range(n):
+                key = key * 64 + int(chars[t + j])
+            bucket = (key * 8 + n) * url_cnn.HASH_MULTIPLIER % url_cnn.HASH_PRIME % WIDE_BUCKETS
+            weights.append(float(table[bucket]))
+    return sum(weights) / max(1, len(weights)) ** 0.5
+
+
+def test_ngram_buckets_skip_padding_and_cover_every_window():
+    chars, roles = encode("ab.c", 6), url_cnn.encode_roles("ab.c", 6)
+    ids = url_cnn.ngram_buckets(chars, roles, 3, 1000)
+    assert len(ids) == 4 + 3 + 2  # 4 characters: unigrams, bigrams, trigrams; no padding
+    assert ids.min() >= 0 and ids.max() < 1000
+    assert len(url_cnn.ngram_buckets(chars, roles, 8, 1000)) == 4 + 3 + 2 + 1
+    assert np.array_equal(ids, url_cnn.ngram_buckets(chars[2:], roles[2:], 3, 1000))
+
+
+def test_v3_wide_with_zero_table_is_exactly_v3(tmp_path):
+    rng = np.random.default_rng(7)
+    members = [v3_member(rng), v3_member(rng)]
+    zero = np.zeros(WIDE_BUCKETS, dtype=np.float32)
+    path, sha = write(tmp_path, v3_artifact(members))
+    plain = UrlCnnModel(path, sha)
+    (tmp_path / "wide").mkdir()
+    path, sha = write(tmp_path / "wide", v3_artifact([m | {"wide": zero} for m in members], True))
+    wide = UrlCnnModel(path, sha)
+    assert plain.artifact is not None and wide.artifact is not None, wide.reason
+    for host in ["example.com", "login.secure-paypa1.co.uk", "a.b", "x" * 60]:
+        text = model_input(host)
+        assert wide.logit(text) == plain.logit(text)
+    assert wide.predict_hostname("example.com").feature_version == url_cnn.FEATURE_VERSION_V3_WIDE
+
+
+def test_v3_wide_adds_the_reference_wide_term_per_member(tmp_path):
+    rng = np.random.default_rng(8)
+    tables = [rng.normal(0, 1, WIDE_BUCKETS).astype(np.float32) for _ in range(2)]
+    members = [v3_member(rng) for _ in tables]
+    path, sha = write(tmp_path, v3_artifact(members))
+    plain = UrlCnnModel(path, sha)
+    (tmp_path / "wide").mkdir()
+    data = v3_artifact([m | {"wide": t} for m, t in zip(members, tables, strict=True)], True)
+    path, sha = write(tmp_path / "wide", data)
+    wide = UrlCnnModel(path, sha)
+    assert wide.artifact is not None, wide.reason
+    for host in ["example.com", "login.secure-paypa1.co.uk", "a.b", "x" * 60]:
+        text = model_input(host)
+        expected = [
+            plain.member_logit(i, text) + reference_wide_term(t, text) for i, t in enumerate(tables)
+        ]
+        for i, value in enumerate(expected):
+            assert wide.member_logit(i, text) == pytest.approx(value, abs=1e-9)
+        assert wide.logit(text) == pytest.approx(float(np.mean(expected)), abs=1e-9)
+
+
+def test_v3_wide_artifact_validation(tmp_path):
+    rng = np.random.default_rng(9)
+    table = np.zeros(WIDE_BUCKETS, dtype=np.float32)
+    good = v3_artifact([v3_member(rng, table)], True)
+    path, sha = write(tmp_path, good)
+    assert UrlCnnModel(path, sha).artifact is not None
+
+    for key, value in (("wide_max_n", 7), ("wide_max_n", 0), ("wide_buckets", 2**25)):
+        path, sha = write(tmp_path, good | {key: value})
+        assert UrlCnnModel(path, sha).artifact is None, (key, value)
+
+    short = v3_artifact([v3_member(rng, table[:-1])], True)
+    path, sha = write(tmp_path, short)
+    assert "Invalid shape" in UrlCnnModel(path, sha).reason
+
+    path, sha = write(tmp_path, v3_artifact([v3_member(rng)], True))  # no wide table
+    assert UrlCnnModel(path, sha).artifact is None
+
+    path, sha = write(tmp_path, good | {"feature_version": url_cnn.FEATURE_VERSION_V3})
+    assert "feature version" in UrlCnnModel(path, sha).reason
+
+    path, sha = write(tmp_path, v3_artifact([v3_member(rng, table)], True, gate="failed"))
+    assert UrlCnnModel(path, sha).artifact is None  # release gate still enforced

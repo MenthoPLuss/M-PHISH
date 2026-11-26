@@ -336,3 +336,57 @@ def test_final_build_merge_scores_the_mean_of_its_members():
     other = dict(singles[1], config=dict(singles[1]["config"], hidden=9))
     with pytest.raises(ValueError, match="config"):
         merge_artifacts([singles[0], other])
+
+
+def test_production_export_matches_torch_and_the_research_runtime(tmp_path):
+    torch = pytest.importorskip("torch")
+    import hashlib
+
+    from backend.app.services.ml.url_cnn import ALPHABET, UrlCnnModel
+    from research.hostname_cnn.export_production import convert
+
+    config = models.defaults("v3wide") | {"channels": 8, "embedding_dim": 6, "hidden": 8}
+    config |= {"wide_buckets": 4096, "wide_max_n": 5}
+    X = models.features("v3wide", HOSTS, config)
+    members = []
+    for seed in (1, 2):
+        torch.manual_seed(seed)
+        model = models.build(torch, "v3wide", config)
+        for _ in range(3):  # make the wide weights non-zero
+            train_one_step(torch, model, X)
+        members.append(model)
+    research = {
+        "format": FORMAT,
+        "feature_version": FEATURE_VERSION,
+        "alphabet": ALPHABET,
+        "config": models.runtime_config("v3wide", config),
+        "members": [models.export_tensors(m) for m in members],
+        "best_epochs": [1, 2],
+        "calibration_slope": 1.2,
+        "calibration_intercept": -0.1,
+        "threshold": 0.8,
+    }
+    raw = json.dumps(convert(research) | {"release_gate": "passed"}).encode()
+    path = tmp_path / "url_cnn.json"
+    path.write_bytes(raw)
+    app = UrlCnnModel(str(path), hashlib.sha256(raw).hexdigest())
+    assert app.artifact is not None, app.reason
+    runtime = V4Numpy(json.loads(json.dumps(research)))
+    with torch.no_grad():
+        expected = np.mean([m(torch.from_numpy(X)).numpy() for m in members], axis=0)
+    for host, value in zip(HOSTS, expected, strict=True):
+        assert app.logit(host) == pytest.approx(runtime.logit(host), abs=1e-9)
+        assert app.logit(host) == pytest.approx(float(value), abs=2e-5)
+
+
+@pytest.mark.parametrize(
+    "change", [{"structure_embeddings": True}, {"wide_buckets": 0}, {"attention_heads": 2}]
+)
+def test_production_export_refuses_builds_the_app_cannot_run(change):
+    from backend.app.services.ml.url_cnn import ALPHABET
+    from research.hostname_cnn.export_production import convert
+
+    config = models.runtime_config("v3wide", models.defaults("v3wide")) | change
+    research = {"format": FORMAT, "feature_version": FEATURE_VERSION, "alphabet": ALPHABET}
+    with pytest.raises(ValueError):
+        convert(research | {"config": config, "members": []})

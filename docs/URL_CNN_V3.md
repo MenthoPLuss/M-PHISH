@@ -297,6 +297,40 @@ The Research page reads the existing `evaluation-v2` format. Load an accepted
 artifact through `ML_CNN_ARTIFACT_PATH` and `ML_CNN_ARTIFACT_SHA256`; use
 `ML_RESEARCH_RESULTS` for its report, then restart the API and worker.
 
+## Wide & Deep variant (`m-phish-charcnn-v3-wide`)
+
+The hostname CNN research (`research/`) found that adding a linear path over hashed
+character n-grams to this network helps most at low false-alarm rates. On validation, the
+3-seed build `F-c13-ensemble3` catches 2.3 points more phishing at a 1% false-positive rate
+than the deployed `cnn-v3-fresh`. It also cuts false alarms on legitimate hosting-platform
+sites from about 37% to 14%, at a cost of about 0.6 points of recall on the original
+validation set. The final test on sealed data has **not** run yet (not before 2026-12-08),
+so the deployed model stays the default.
+
+The format is the v3 network plus one `wide` tensor per member (`wide_buckets` values,
+n-grams up to `wide_max_n`). Each member's wide term is added to its logit before the
+ensemble mean. `research/hostname_cnn/export_production.py` converts a research build.
+The tensors are copied unchanged, and the export is refused unless this app's loader
+reproduces the build's logits on every calibration and validation hostname:
+
+```
+python -m research.hostname_cnn.export_production --build F-c13-ensemble3
+```
+
+For `F-c13-ensemble3` the result is `runs/cnn-v3wide-c13-ensemble3/url_cnn.json`: 18.2 MB,
+SHA-256 `6301ab4bf77bf881c117e59ba61981439890e0284bc355a8443c5e01aed10ca8`. Its logits
+are identical on all 152,476 hostnames, it changes no decisions, and it scores a hostname
+in about 3 ms. Like `cnn-v3-fresh`, its release gate is `failed`, so it is served only with
+`ML_CNN_ALLOW_UNGATED=true`, and never with `APP_ENV=production`. To try it locally, change
+the two settings and restart the API and worker:
+
+```
+ML_CNN_ARTIFACT_PATH=<repo>\runs\cnn-v3wide-c13-ensemble3\url_cnn.json
+ML_CNN_ARTIFACT_SHA256=6301ab4bf77bf881c117e59ba61981439890e0284bc355a8443c5e01aed10ca8
+```
+
+Switch back by restoring the `cnn-v3-fresh` path and checksum.
+
 ## Limits
 
 This model sees hostnames, not paths, page content, credentials, or browser actions.

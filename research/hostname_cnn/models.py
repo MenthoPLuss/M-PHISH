@@ -26,7 +26,9 @@ from __future__ import annotations
 import numpy as np
 
 from backend.app.services.ml.train_url_cnn import build_model_v3, model_features
-from backend.app.services.ml.url_cnn import (
+from backend.app.services.ml.url_cnn import (  # noqa: F401  (ngram_buckets is re-exported)
+    HASH_MULTIPLIER,
+    HASH_PRIME,
     NORM_EPS,
     PAD,
     ROLE_COUNT,
@@ -36,6 +38,7 @@ from backend.app.services.ml.url_cnn import (
     VOCAB_SIZE,
     encode,
     encode_roles,
+    ngram_buckets,
 )
 
 LABEL_SLOTS = 9  # 0 = padding, 1..8 = label index 0..7 from the right (7 = "7 or more")
@@ -61,24 +64,8 @@ V4_DEFAULTS = V3_DEFAULTS | {
     "wide_max_n": 5,
 }
 WIDE_DEFAULTS = {"wide_buckets": 2**20, "wide_max_n": 5}
-# n-gram key = ((role * 64 + c0) * 64 + c1 ...) * 8 + n  (< 3.5e10 for n <= 5), then
-# bucket = key * 48271 mod (2^31 - 1) mod buckets: exact in int64 for torch and NumPy alike.
-HASH_MULTIPLIER, HASH_PRIME = 48271, 2_147_483_647
-
-
-def ngram_buckets(chars: np.ndarray, roles: np.ndarray, max_n: int, buckets: int) -> np.ndarray:
-    """Wide-path bucket ids of one encoded hostname (NumPy twin of ``wide_term``)."""
-    chars, roles = chars.astype(np.int64), roles.astype(np.int64)
-    valid = chars != PAD
-    out = []
-    for n in range(1, min(max_n, len(chars)) + 1):
-        windows = np.lib.stride_tricks.sliding_window_view(chars, n)
-        key = roles[: len(chars) - n + 1].copy()
-        for j in range(n):
-            key = key * 64 + windows[:, j]
-        ok = np.lib.stride_tricks.sliding_window_view(valid, n).all(1)
-        out.append(((key * 8 + n) * HASH_MULTIPLIER % HASH_PRIME % buckets)[ok])
-    return np.concatenate(out) if out else np.zeros(0, dtype=np.int64)
+# The n-gram hash (HASH_MULTIPLIER, HASH_PRIME) and its NumPy twin ``ngram_buckets`` live in
+# the backend runtime, so the app and the research harness share one definition.
 
 
 def wide_term(table, chars, roles, max_n: int, buckets: int):

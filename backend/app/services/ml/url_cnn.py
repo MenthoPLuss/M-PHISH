@@ -24,6 +24,13 @@ Three artifact formats are supported (architecture must match the training scrip
     with per-position layer normalization -> masked max, mean, attention and domain-name
     pooling -> classifier. Padding is masked throughout, including between convolutions.
 
+``m-phish-charcnn-v3-wide`` (v3 + Wide & Deep n-gram path; research hypothesis H12)
+    The v3 network, plus a linear "wide" term per member: one weight per hashed character
+    n-gram (n = 1..``wide_max_n``, keyed by the hostname component of its first character),
+    summed and divided by sqrt(n-gram count), added to that member's logit. Each member
+    stores the table as ``wide`` (``wide_buckets`` float32 values). Produced from research
+    builds by ``research/hostname_cnn/export_production.py``.
+
 The logit is Platt-calibrated on a held-out split, and a validation-selected
 threshold decides whether the model contributes a warning floor.
 """
@@ -50,7 +57,20 @@ ARTIFACT_FORMAT_V2 = "m-phish-charcnn-v2"
 FEATURE_VERSION_V2 = "hostname-chars-roles-v1"
 ARTIFACT_FORMAT_V3 = "m-phish-charcnn-v3"
 FEATURE_VERSION_V3 = "hostname-chars-roles-masked-v1"
+ARTIFACT_FORMAT_V3_WIDE = "m-phish-charcnn-v3-wide"
+FEATURE_VERSION_V3_WIDE = "hostname-chars-roles-masked-ngram-v1"
+FEATURE_VERSIONS = {
+    ARTIFACT_FORMAT: FEATURE_VERSION,
+    ARTIFACT_FORMAT_V2: FEATURE_VERSION_V2,
+    ARTIFACT_FORMAT_V3: FEATURE_VERSION_V3,
+    ARTIFACT_FORMAT_V3_WIDE: FEATURE_VERSION_V3_WIDE,
+}
 NORM_EPS = 1e-5
+# Wide path: n-gram key = ((role * 64 + c0) * 64 + c1 ...) * 8 + n, then
+# bucket = key * 48271 mod (2^31 - 1) mod buckets. Exact in int64 for n <= 6.
+HASH_MULTIPLIER, HASH_PRIME = 48271, 2_147_483_647
+MAX_WIDE_N = 6
+MAX_WIDE_BUCKETS = 2**24
 # Index 0 = padding, 1 = unknown character, then this alphabet.
 ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789-._"
 PAD, UNKNOWN = 0, 1
@@ -108,6 +128,24 @@ def encode_roles(text: str, max_length: int) -> np.ndarray:
     if roles:
         encoded[max_length - len(roles) :] = roles
     return encoded
+
+
+def ngram_buckets(chars: np.ndarray, roles: np.ndarray, max_n: int, buckets: int) -> np.ndarray:
+    """Wide-path bucket ids of one encoded hostname. N-grams touching padding are skipped.
+
+    Must match the training-time ``wide_term`` in ``research/hostname_cnn/models.py``.
+    """
+    chars, roles = chars.astype(np.int64), roles.astype(np.int64)
+    valid = chars != PAD
+    out = []
+    for n in range(1, min(max_n, len(chars)) + 1):
+        windows = np.lib.stride_tricks.sliding_window_view(chars, n)
+        key = roles[: len(chars) - n + 1].copy()
+        for j in range(n):
+            key = key * 64 + windows[:, j]
+        ok = np.lib.stride_tricks.sliding_window_view(valid, n).all(1)
+        out.append(((key * 8 + n) * HASH_MULTIPLIER % HASH_PRIME % buckets)[ok])
+    return np.concatenate(out) if out else np.zeros(0, dtype=np.int64)
 
 
 def _sigmoid(value: float) -> float:
@@ -172,11 +210,7 @@ class UrlCnnModel:
             if hashlib.sha256(raw).hexdigest() != checksum.lower():
                 raise ValueError("Artifact checksum mismatch")
             data = json.loads(raw)
-            version = {
-                ARTIFACT_FORMAT: FEATURE_VERSION,
-                ARTIFACT_FORMAT_V2: FEATURE_VERSION_V2,
-                ARTIFACT_FORMAT_V3: FEATURE_VERSION_V3,
-            }.get(data.get("format"))
+            version = FEATURE_VERSIONS.get(data.get("format"))
             if version is None or data.get("alphabet") != ALPHABET:
                 raise ValueError("Incompatible CNN artifact format or alphabet")
             if data.get("feature_version") != version:
@@ -187,7 +221,7 @@ class UrlCnnModel:
                 if not allow_ungated and (not allow or os.getenv("APP_ENV") == "production"):
                     raise ValueError("Artifact has not passed its scoped detection gates")
                 self.ungated = True
-            if data["format"] == ARTIFACT_FORMAT_V3:
+            if data["format"] in (ARTIFACT_FORMAT_V3, ARTIFACT_FORMAT_V3_WIDE):
                 self.members = self._load_v3(data)
             elif data["format"] == ARTIFACT_FORMAT_V2:
                 self.members = self._load_v2(data)
@@ -201,11 +235,7 @@ class UrlCnnModel:
 
     @property
     def feature_version(self) -> str:
-        if self.artifact and self.artifact.get("format") == ARTIFACT_FORMAT_V3:
-            return FEATURE_VERSION_V3
-        if self.artifact and self.artifact.get("format") == ARTIFACT_FORMAT_V2:
-            return FEATURE_VERSION_V2
-        return FEATURE_VERSION
+        return FEATURE_VERSIONS.get((self.artifact or {}).get("format"), FEATURE_VERSION)
 
     @staticmethod
     def _check_calibration(data: dict) -> None:
@@ -319,6 +349,10 @@ class UrlCnnModel:
         members = data["members"]
         if not isinstance(members, list) or not 1 <= len(members) <= MAX_MEMBERS:
             raise ValueError("Unsupported ensemble size")
+        wide = data["format"] == ARTIFACT_FORMAT_V3_WIDE
+        if wide:
+            buckets = dimension("wide_buckets", 1, MAX_WIDE_BUCKETS)
+            dimension("wide_max_n", 1, MAX_WIDE_N)
 
         def pair(entry, weight_shape, bias_shape, name):
             return (
@@ -353,11 +387,17 @@ class UrlCnnModel:
                     "out": pair(member["out"], (1, hidden), (1,), "out"),
                 }
             )
+            if wide:
+                loaded[-1]["wide"] = _packed(member["wide"], (buckets,), "wide")
         return loaded
 
     def logit(self, text: str) -> float:
         """Forward pass identical to the PyTorch module(s) used in training."""
-        if self.artifact.get("format") in (ARTIFACT_FORMAT_V2, ARTIFACT_FORMAT_V3):
+        if self.artifact.get("format") in (
+            ARTIFACT_FORMAT_V2,
+            ARTIFACT_FORMAT_V3,
+            ARTIFACT_FORMAT_V3_WIDE,
+        ):
             return float(np.mean([self.member_logit(m, text) for m in range(len(self.members))]))
         weights, length = self.weights, int(self.artifact["max_length"])
         x = weights["embedding"][encode(text, length)]  # (L, E)
@@ -372,7 +412,7 @@ class UrlCnnModel:
 
     def member_logit(self, index: int, text: str) -> float:
         """One deep ensemble member (used directly by the training parity check)."""
-        if self.artifact["format"] == ARTIFACT_FORMAT_V3:
+        if self.artifact["format"] in (ARTIFACT_FORMAT_V3, ARTIFACT_FORMAT_V3_WIDE):
             return self._member_logit_v3(index, text)
         w, length = self.members[index], int(self.artifact["max_length"])
         h = w["embedding"][encode(text, length)] + w["roles"][encode_roles(text, length)]
@@ -434,7 +474,12 @@ class UrlCnnModel:
         weight, bias = w["dense"]
         hidden = np.maximum(weight @ pooled + bias, 0)
         weight, bias = w["out"]
-        return float((weight @ hidden + bias)[0])
+        logit = float((weight @ hidden + bias)[0])
+        if "wide" in w:
+            a = self.artifact
+            ids = ngram_buckets(chars, roles, a["wide_max_n"], a["wide_buckets"])
+            logit += float(w["wide"][ids].sum()) / math.sqrt(max(1, len(ids)))
+        return logit
 
     def predict_hostname(self, hostname: str) -> Prediction:
         text = model_input(hostname)

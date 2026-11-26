@@ -785,3 +785,36 @@ The members are copied unchanged from the C13 runs (chosen epochs 14, 17 and 15)
 2. A production format and loader in the backend, if the user wants to deploy it. The app is
    out of scope for this research.
 3. Optional: the pAUC objective (H2b), with a matching control.
+
+## 2026-11-27
+
+### Backend loader for `F-c13-ensemble3` (user: build the loader now; deploy after the sealed test)
+
+The user chose to build the production loader before the sealed test. This accepts the H1
+trade-off (recall about 0.6 points below the original validation set, just past the 0.5
+limit) in exchange for the drop in false alarms on hosting platforms. The app's default model is
+unchanged: `.env` still points at `cnn-v3-fresh`.
+
+- **Format:** `m-phish-charcnn-v3-wide`, feature version `hostname-chars-roles-masked-ngram-v1`.
+  It is the deployed v3 layout plus `wide_buckets`, `wide_max_n` and one `wide` tensor per
+  member. The loader limits `wide_max_n` to 6, where the hash is still exact in int64, and
+  `wide_buckets` to 2^24.
+- **One hash definition:** `ngram_buckets` and its constants moved to
+  `backend/app/services/ml/url_cnn.py`; `research/hostname_cnn/models.py` imports them. The
+  PyTorch `wide_term` stays in research.
+- **Export:** `export_production.py` copies the tensors byte for byte and keeps the build's
+  calibration and threshold. It refuses builds that are not v3wide, builds from uncommitted
+  code, and build records that report the test split or lockbox as used.
+- **Check:** the app's own `UrlCnnModel` rescored all 76,515 calibration and 75,961 validation
+  hostnames. The maximum logit difference from the build's NumPy logits was 0.0, with 0 changed
+  decisions. It takes 3.1 ms per hostname, including calibration.
+- **Artifact:** `runs/cnn-v3wide-c13-ensemble3/url_cnn.json`, 18.2 MB, SHA-256
+  `6301ab4bf77bf881c117e59ba61981439890e0284bc355a8443c5e01aed10ca8`. It keeps
+  `release_gate: "failed"`, like `cnn-v3-fresh`.
+- **Tests:** these cover the new loader against naive reference loops; a zero wide table
+  reproducing plain v3 exactly; validation of the new fields; agreement of the export with
+  PyTorch and the research runtime; and refusal of unconvertible builds. 119 backend and
+  research tests pass.
+
+**Still to do:** the sealed final test on or after 2026-12-08. If it passes, point
+`ML_CNN_ARTIFACT_PATH` at the new file.
