@@ -390,3 +390,28 @@ def test_production_export_refuses_builds_the_app_cannot_run(change):
     research = {"format": FORMAT, "feature_version": FEATURE_VERSION, "alphabet": ALPHABET}
     with pytest.raises(ValueError):
         convert(research | {"config": config, "members": []})
+
+
+def test_phase11_early_summary_and_verdict_run_end_to_end():
+    from research.hostname_cnn.phase11_early import summarize
+
+    rng = np.random.default_rng(0)
+    y = np.r_[np.zeros(3000), np.ones(400)].astype(int)
+    weak = rng.normal(0, 1, len(y)) + 1.5 * y
+    strong = weak + 1.0 * y  # the candidate separates the classes better
+    artifact = {"calibration_slope": 1.0, "calibration_intercept": -3.0, "threshold": 0.5}
+    groups = {"first half": np.arange(len(y)) < len(y) // 2}
+    z = {
+        "deployed": {"sealed": weak, "test": weak},
+        "candidate": {"sealed": strong, "test": strong},
+    }
+    artifacts = {"deployed": artifact, "candidate": artifact}
+    results, verdict = summarize(artifacts, y, y, z, groups, groups, 400, 50)
+    json.dumps(results, default=float)  # the record must serialise
+    assert results["sealed"]["candidate"]["operating"]["first half"]["legitimate"] == 1700
+    assert verdict["A_detection"] == "pass" and verdict["C_test_split"] == "pass"
+    _, few = summarize(artifacts, y, y, z, groups, groups, 299, 20)
+    assert few["A_detection"] == "inconclusive" and not few["deploy"]
+    swapped = {"deployed": z["candidate"], "candidate": z["deployed"]}
+    _, worse = summarize(artifacts, y, y, swapped, groups, groups, 400, 50)
+    assert worse["A_detection"] == "fail" and not worse["deploy"]

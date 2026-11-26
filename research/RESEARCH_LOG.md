@@ -818,3 +818,76 @@ unchanged: `.env` still points at `cnn-v3-fresh`.
 
 **Still to do:** the sealed final test on or after 2026-12-08. If it passes, point
 `ML_CNN_ARTIFACT_PATH` at the new file.
+
+### Plan — early final test (Phase 11-early), written before any lockbox data is read or scored
+
+The user asked not to wait for 2026-12-08. Phase 1 named this fallback (proposal §6, item 6):
+test with what exists now and state a weaker claim. It is strengthened with the one temporal
+part that can be built today.
+
+**Decisions taken before opening:**
+- **H2b dropped.** It is optional, would take several CPU hours, and model selection must end
+  before the lockbox opens. The candidate is fixed: `cnn-v3wide-c13-ensemble3`, SHA-256
+  `6301ab4b…10ca8`, threshold 0.8466. The control is the deployed `cnn-v3-fresh`.
+- **Both models are scored by the app's own loader** (`UrlCnnModel`), so the results are what
+  the app would compute.
+
+**Test material:**
+1. **Legitimate bank** (part 1, built 2026-11-24, sealed): 200,000 CrUX 2026-10 hostnames.
+2. **Early temporal phishing holdout** (part 2, early): hostnames on today's Phishing.Database
+   ACTIVE list that were absent on 2026-11-24. Any hostname whose registered domain or name stem
+   is in the h1-v2 dataset (any split), or whose registered domain is in the bank, is excluded.
+   This is 3 days of new phishing instead of the planned 2+ weeks.
+3. **Reported test split** of h1-v2 (75,889 hostnames), scored once, for both models.
+4. **Left out:** part 3, new sites in CrUX 2026-11, which is not published until about
+   2026-12-08.
+
+**Pass criteria for deploying the candidate (all must hold):**
+- **A. Detection:** on bank + early phishing holdout, the paired bootstrap 95% lower bound of
+  recall at 1% FPR (candidate − deployed) is above −0.5 points. This is non-inferiority with
+  the H1 margin.
+- **B. False alarms:** the candidate's FPR on the bank at its own threshold has a Wilson 95%
+  upper bound of 1.0% or less.
+- **C. No regression on the test split:** the paired bootstrap 95% lower bound of pAUC
+  (FPR ≤ 1%) is above −0.005.
+
+If the holdout has fewer than 300 phishing hostnames, criterion A is reported as
+inconclusive. The deployed model then stays, pending the full parts 2–3 after 2026-12-08.
+
+**What the claim will be:** a pass supports deploying on a temporal holdout only 3 days old,
+plus a static legitimate bank. It is not the planned final claim. Parts 2–3 built after
+2026-12-08 stay unseen and remain a clean confirmation: they are new data that no decision
+here used.
+
+**Amendment, before anything was built or scored: the phishing source changes.**
+Today's Phishing.Database ACTIVE list is byte-identical to the 2026-11-24 snapshot (SHA-256
+`70c6c2e2…`), and the project's last feed commit was 2026-10-02. That source produces no new
+phishing, now or on 2026-12-08. Part 2 (early) therefore uses two live public feeds,
+downloaded 2026-11-27 into `data/feeds/2026-11-27/raw/`:
+- **OpenPhish community feed** (`openphish-feed.txt`, 300 URLs, SHA-256 `78d939f0…1e38`).
+- **Phishing Army blocklist** (`phishing-army-blocklist.txt`, generated 2026-11-26T20:01Z,
+  146,590 domains, SHA-256 `d57f8f5f…a5a4`). It aggregates PhishTank, OpenPhish, CERT.PL,
+  Phishunt, urlscan.io, PhishStats, StalkPhish, URLAbuse and AntiPhish.org, and it states that
+  it does not list shared-hosting platforms wholesale. Its terms are free for personal and
+  individual use; the files stay local and out of git.
+
+The exclusions are unchanged, plus: hostnames on the 2026-11-24 Phishing.Database list, and the
+list's own harmless test domains (`amiprotected.it`). This is now a *cross-source* temporal
+holdout. It is harder than the planned same-source one, because neither model saw these feeds,
+and it affects both models equally. Recall is also reported per feed. The pass criteria do not
+change.
+
+**Holdout built (01:43):** 137,887 phishing hostnames (239 from OpenPhish, 137,884 from
+Phishing Army). Of the 144,825 listed hostnames, 4,796 were excluded because their registered
+domain is in h1-v2, 1,207 because their stem is, 897 because they are on the 2026-11-24 list,
+37 because their domain is in the bank, and 1 test domain. SHA-256 `13bbc54d…8d29`, recorded in
+the lockbox manifest. A 25-hostname random sample looked like phishing (brand lookalikes such as
+`allegrolokalnie.*.cyou` and `aldiuk.*.shop`, crypto scams, throwaway pages on hosting
+platforms).
+
+**First scoring attempt crashed before any metric existed (01:43–01:51).** Both models scored
+every hostname, then `operating()` raised `TypeError` (`dict | dict_items`) before any metric
+was computed. Nothing was written or printed, so no result was seen and nothing can have been
+tuned to it. Fixes: the logits are now saved before metrics are computed, a rerun reuses them,
+and the metric and verdict code (`summarize`) is tested on synthetic data. The rerun uses the
+same pre-registered criteria, models and holdout.
