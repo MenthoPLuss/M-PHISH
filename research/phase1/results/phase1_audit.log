@@ -1,0 +1,12 @@
+Read 435795 rows -> 419036 unique hostnames (184244 phishing, 234792 legitimate); dropped 58 hostnames with conflicting labels.
+Label check passed: 4/5 anchor sites legitimate.
+loaded 419036 hosts 11 s
+described 19 s
+scored 92045 97 s
+analysed fresh 108 s
+analysed ens3 120 s
+label conflicts 135 s
+probes 169 s
+baseline plain 0.914193143922092 211 s
+baseline component markers 0.9151387526461605 258 s
+done 258 s
