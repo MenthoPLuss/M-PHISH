@@ -3,7 +3,7 @@
 Research toward the next version of M-PHISH's hostname model. The deployed model
 (`cnn-v3-fresh`) is unchanged, and the app never imports anything in this folder.
 
-## Status (2026-11-26)
+## Status (2026-11-27)
 
 - **Phase 1 audit:** done. See `phase1/`.
 - **Wave 1 (one seed per idea):** finished.
@@ -40,7 +40,15 @@ Research toward the next version of M-PHISH's hostname model. The deployed model
     logits are identical to the build's on all 152,476 calibration and validation
     hostnames.
   - The app still serves `cnn-v3-fresh`. To switch, see `docs/URL_CNN_V3.md`.
-- **Final test:** run once on a sealed set no earlier than 2026-12-08.
+- **Early final test (Phase 11-early, 2026-11-27): do not deploy (2 of 3 criteria pass).**
+  - Phishing.Database stopped updating on 2026-10-02, so the new-phishing holdout (137,887
+    hostnames) comes from the live OpenPhish and Phishing Army feeds.
+  - Passed: recall at 1% FPR is +3.5 points over the deployed model on unseen data, and test-split
+    pAUC is +0.040.
+  - Failed: the candidate's false-alarm rate on the 200,000-site legitimate bank is 1.05% (upper
+    bound 1.09%) against a 1.0% limit. The deployed model's is higher, at 1.59%.
+  - The app is unchanged. The next step is a product decision or a stricter threshold; see the
+    last entry in `RESEARCH_LOG.md`.
 
 Every decision, with its evidence, is in [`RESEARCH_LOG.md`](RESEARCH_LOG.md).
 
@@ -56,6 +64,7 @@ Every decision, with its evidence, is in [`RESEARCH_LOG.md`](RESEARCH_LOG.md).
 | `hostname_cnn/datasets.py`, `ngram.py`, `lockbox.py` | Dataset variants, the n-gram baseline, and the sealed test set |
 | `hostname_cnn/calibration.py` | H10: calibrator comparison, threshold stability, false alarms by site |
 | `hostname_cnn/final_build.py` | Merges finished runs into one ensemble artifact and checks it on every hostname |
+| `hostname_cnn/phase11_early.py` | The early final test: builds the new-phishing holdout and scores both models once |
 | `hostname_cnn/export_production.py` | Converts a final build to the app's `m-phish-charcnn-v3-wide` format and checks the app's loader on every hostname |
 | `hostname_cnn/tests/` | Tests for parity, invariances, metrics and safeguards |
 
@@ -70,6 +79,7 @@ python -m research.hostname_cnn.compare diff --control <run> --candidates <run> 
 python -m research.hostname_cnn.calibration --name <name> --runs <run> ...
 python -m research.hostname_cnn.final_build --name <name> --runs <run> ...
 python -m research.hostname_cnn.export_production --build F-<name>
+python -m research.hostname_cnn.phase11_early build|score   # score needs the Phase 11 unlock
 ```
 
 Runs are written to `runs/research/<id>/`. That folder and the datasets under `data/feeds/`

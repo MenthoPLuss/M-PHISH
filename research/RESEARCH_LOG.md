@@ -891,3 +891,69 @@ was computed. Nothing was written or printed, so no result was seen and nothing 
 tuned to it. Fixes: the logits are now saved before metrics are computed, a rerun reuses them,
 and the metric and verdict code (`summarize`) is tested on synthetic data. The rerun uses the
 same pre-registered criteria, models and holdout.
+
+### Phase 11-early results (02:16; `runs/research/P11-early/results.json`, git `3362746`, clean)
+
+The sealed set is 200,000 bank hostnames plus 137,887 early phishing hostnames. The test split
+has 75,889 hostnames, including the deployed model's original 62,489. Both models were scored by
+the app's loader, with 1,000 paired bootstrap draws. The wall time was 20.9 minutes.
+
+**Verdict: do not deploy.** A passes and C passes; B fails narrowly.
+
+| Criterion | Result | Rule |
+| --- | --- | --- |
+| A. Recall at 1% FPR, sealed set (candidate − deployed) | +3.47 pts [+3.04, +3.84] → **pass** | lower bound > −0.5 |
+| B. Candidate FPR on the bank at its threshold | 1.05%, Wilson [1.00, 1.09] → **fail** | upper bound ≤ 1.0% |
+| C. pAUC on the test split (candidate − deployed) | +0.040 [+0.034, +0.045] → **pass** | lower bound > −0.005 |
+
+**Sealed set (bank + early phishing):**
+
+| Metric | Deployed `cnn-v3-fresh` | Candidate | Difference [95% CI] |
+| --- | --- | --- | --- |
+| ROC-AUC | 0.8533 | 0.8521 | −0.0012 [−0.0022, −0.0003] |
+| pAUC (FPR ≤ 1%) | 0.5976 | 0.6142 | +0.0166 [+0.0148, +0.0183] |
+| Recall at 0.1% FPR | 11.95% | 16.13% | +4.18 pts [+3.56, +4.88] |
+| Recall at 1% FPR | 26.18% | 29.65% | +3.47 pts [+3.04, +3.84] |
+| Bank FPR at own threshold | **1.59%** [1.54, 1.65] | **1.05%** [1.00, 1.09] | |
+| Bank FPR, hosting platforms (2,013) | 46.2% | 15.2% | |
+| Bank FPR, ICANN suffixes (197,987) | 1.14% | 0.90% | |
+| Recall at own threshold, all | 31.0% | 30.1% | |
+| Recall at own threshold, OpenPhish (239) | 87.0% | 79.9% | |
+
+**Test split (h1-v2, 75,889):**
+
+| Metric | Deployed | Candidate | Difference [95% CI] |
+| --- | --- | --- | --- |
+| ROC-AUC | 0.9127 | 0.9284 | +0.0157 [+0.0143, +0.0170] |
+| pAUC (FPR ≤ 1%) | 0.7319 | 0.7714 | +0.0395 [+0.0344, +0.0449] |
+| Recall at 1% FPR | 56.59% | 62.95% | +6.36 pts [+5.63, +7.10] |
+| FPR at own threshold (original 62,489 subset) | 2.17% (0.92%) | 0.73% (0.63%) | |
+| Recall at own threshold | 62.8% | 60.6% | |
+
+**Reading:**
+- **Ranking:** the candidate ranks phishing above legitimate hostnames better than the deployed
+  model wherever it matters (low FPR), on unseen data from feeds neither model was trained on.
+  Whole-curve ROC-AUC on the sealed set is 0.001 lower, outside the operating region.
+- **Why B fails:** the candidate's validation-chosen threshold gives 1.05% false alarms on the
+  CrUX bank. The upper bound misses the 1.0% limit by 0.09 points. The **deployed** model would
+  fail B by more: 1.59%. B is an absolute rule, so the outcome is still "do not deploy". The rule
+  is not reinterpreted after the fact.
+- **Hosting platforms:** the benefit of H1 holds on unseen data. False alarms on legitimate
+  hosting-platform sites fall from 46% to 15%.
+- **Recall on Phishing Army is low for both** (about 30% at threshold). That feed is mostly
+  attacker-registered throwaway domains with no brand in the name, which a hostname-only model
+  sees least clearly. On OpenPhish both catch about 80–87%.
+- **Both models are miscalibrated on new data:** their thresholds, set on validation, give more
+  false alarms on the bank than on validation (0.91% → 1.05% for the candidate). The site
+  clustering found in H10 predicted this. The validation interval of [0.62, 1.40] contains 1.05.
+
+**State:** `.env` stays on `cnn-v3-fresh`. Nothing in the app changed.
+
+**What would settle it (not done; each needs the user):**
+1. **Product decision:** deploy anyway. The candidate beats the deployed model on every
+   criterion, including false alarms (1.05% vs 1.59%). Only the absolute 1.0% bound fails, and
+   the deployed model fails it too. Switching is two `.env` lines (`docs/URL_CNN_V3.md`).
+2. **Stricter threshold, confirmed on clean data:** pre-register a threshold rule on
+   validation only (for example, site-clustered upper bound ≤ 1%, per H10). Then test criterion B
+   on CrUX 2026-11 sites new since 2026-10 (part 3, about 2026-12-08). That data is still unseen.
+   The bank and the early holdout are now spent and cannot choose a threshold.

@@ -304,8 +304,14 @@ character n-grams to this network helps most at low false-alarm rates. On valida
 3-seed build `F-c13-ensemble3` catches 2.3 points more phishing at a 1% false-positive rate
 than the deployed `cnn-v3-fresh`. It also cuts false alarms on legitimate hosting-platform
 sites from about 37% to 14%, at a cost of about 0.6 points of recall on the original
-validation set. The final test on sealed data has **not** run yet (not before 2026-12-08),
-so the deployed model stays the default.
+validation set.
+
+An early final test was run on 2026-11-27 on unseen data: 200,000 legitimate CrUX sites and
+137,887 new phishing hostnames from the OpenPhish and Phishing Army feeds. At a 1% false-alarm
+rate the variant catches 3.5 points more phishing than `cnn-v3-fresh`. At its own threshold, it
+raises false alarms on 1.05% of the legitimate sites, against 1.59% for `cnn-v3-fresh`. The
+pre-registered deployment rule required at most 1.0%, so the deployed model stays the default.
+The full results are in `research/RESEARCH_LOG.md` (Phase 11-early).
 
 The format is the v3 network plus one `wide` tensor per member (`wide_buckets` values,
 n-grams up to `wide_max_n`). Each member's wide term is added to its logit before the
